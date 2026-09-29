@@ -27,6 +27,7 @@ from .const import (
     CONF_PROTOCOL_VERSION,
     DOMAIN,
 )
+from .gateway import get_gateway_registry
 from .helpers.config import get_device_id
 from .helpers.device_config import possible_matches
 from .helpers.log import log_json
@@ -60,6 +61,7 @@ class TuyaLocalDevice(object):
         poll_only=False,
         manufacturer=None,
         model=None,
+        temporary=False,
     ):
         """
         Represents a Tuya-based device.
@@ -75,6 +77,7 @@ class TuyaLocalDevice(object):
             poll_only (bool): True if the device should be polled only.
             manufacturer (str | None): The device manufacturer, if known.
             model (str | None): The device model, if known.
+            temporary (bool): Release gateway leases after connection probes.
         """
         self._name = name
         self._manufacturer = manufacturer
@@ -90,27 +93,21 @@ class TuyaLocalDevice(object):
         self._api_working_protocol_failures = 0
         self.dev_id = dev_id
         self.dev_cid = dev_cid
+        self._gateway = None
+        self._broker = None
+        self._gateway_settings = (address, local_key)
+        self._gateway_task = None
+        self._stop_task = None
+        self._closed = False
+        self._test_device = temporary
+        self._dps_to_request = None
+        self._gateway_configure_pending = True
         try:
             if dev_cid:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
-                    parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
-                    parent_lock = hass.data[DOMAIN][dev_id].get(
-                        "tuyadevicelock", asyncio.Lock()
-                    )
-                else:
-                    parent = tinytuya.Device(dev_id, address, local_key)
-                    parent_lock = asyncio.Lock()
-                    if name != "Test":
-                        hass.data[DOMAIN][dev_id] = {
-                            "tuyadevice": parent,
-                            "tuyadevicelock": parent_lock,
-                        }
-                self._api = tinytuya.Device(
-                    dev_cid,
-                    cid=dev_cid,
-                    parent=parent,
-                )
-                self._api_lock = parent_lock
+                # Acquire asynchronously on first use. Constructors run in HA's
+                # executor, which must not race to create shared hass.data state.
+                self._api = None
+                self._api_lock = asyncio.Lock()
             else:
                 if hass.data[DOMAIN].get(dev_id) and name != "Test":
                     self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
@@ -135,8 +132,9 @@ class TuyaLocalDevice(object):
             raise e
 
         # we handle retries at a higher level so we can rotate protocol version
-        self._api.set_socketRetryLimit(1)
-        if self._api.parent:
+        if not dev_cid:
+            self._api.set_socketRetryLimit(1)
+        if not dev_cid and self._api.parent:
             # Retries cause problems for other children of the parent device
             self._api.parent.set_socketRetryLimit(1)
 
@@ -198,11 +196,14 @@ class TuyaLocalDevice(object):
 
     @callback
     def actually_start(self, event=None):
+        if self._closed or self._running:
+            return
         _LOGGER.debug("Starting monitor loop for %s", self.name)
         self._running = True
-        self._shutdown_listener = self._hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STOP, self.async_stop
-        )
+        if not self._shutdown_listener:
+            self._shutdown_listener = self._hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, self.async_stop
+            )
         if not self._refresh_task:
             self._refresh_task = self._hass.async_create_task(self.receive_loop())
 
@@ -220,6 +221,14 @@ class TuyaLocalDevice(object):
             )
 
     async def async_stop(self, event=None):
+        if self.dev_cid:
+            if self._stop_task is None:
+                self._closed = True
+                self._stop_task = self._hass.loop.create_task(
+                    self._async_stop_gateway()
+                )
+            await asyncio.shield(self._stop_task)
+            return
         _LOGGER.debug("Stopping monitor loop for %s", self.name)
         self._running = False
         self._children.clear()
@@ -231,6 +240,99 @@ class TuyaLocalDevice(object):
             await self._refresh_task
         _LOGGER.debug("Monitor loop for %s stopped", self.name)
         self._refresh_task = None
+
+    async def _async_stop_gateway(self):
+        self._running = False
+        for listener in (self._startup_listener, self._shutdown_listener):
+            if listener:
+                listener()
+        self._startup_listener = self._shutdown_listener = None
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except CancelledError:
+                pass
+            self._refresh_task = None
+        if self._gateway_task:
+            try:
+                await self._gateway_task
+            except Exception:
+                _LOGGER.debug(
+                    "Gateway acquisition failed during shutdown", exc_info=True
+                )
+        await self.async_release_gateway()
+        self._children.clear()
+        self._force_dps.clear()
+        self._reset_cached_state()
+
+    async def _async_ensure_gateway(self):
+        if self._closed or self._hass.is_stopping:
+            raise RuntimeError("Gateway child is stopped")
+        if self._gateway is not None:
+            return
+        if self._gateway_task is None:
+            self._gateway_task = self._hass.loop.create_task(
+                self._async_acquire_gateway()
+            )
+        task = self._gateway_task
+        try:
+            await asyncio.shield(task)
+        except CancelledError:
+            # Acquisition may already have created a worker. Finish it before
+            # releasing, even if setup or a connection probe was cancelled.
+            await task
+            await self.async_release_gateway()
+            raise
+        finally:
+            self._gateway_task = None
+
+    async def _async_acquire_gateway(self):
+        registry = get_gateway_registry(self._hass)
+        self._gateway, self._api = await registry.acquire(
+            self.dev_id, *self._gateway_settings, self.dev_cid, self._gateway_receive
+        )
+        self._broker = self._gateway.broker
+        self._api_lock = self._gateway.lock
+        if self._closed or self._hass.is_stopping:
+            await self.async_release_gateway()
+            raise RuntimeError("Gateway child is stopped")
+        bucket = self._hass.data.get(DOMAIN, {}).get(self.unique_id)
+        if bucket and bucket.get("device") is self:
+            bucket["tuyadevice"] = self._api
+            bucket["tuyadevicelock"] = self._api_lock
+        if not self._shutdown_listener:
+            self._shutdown_listener = self._hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, self.async_stop
+            )
+
+    async def async_release_gateway(self):
+        """Release a probe's lease without discarding its detection cache."""
+        if self._gateway is None:
+            return
+        task = self._hass.loop.create_task(
+            get_gateway_registry(self._hass).release(self.dev_id, self._gateway_receive)
+        )
+        try:
+            await asyncio.shield(task)
+        except CancelledError:
+            await task
+            raise
+        finally:
+            self._gateway = self._broker = None
+            if self._shutdown_listener:
+                self._shutdown_listener()
+                self._shutdown_listener = None
+
+    @callback
+    def _gateway_receive(self, data):
+        if self._closed or self._temporary_poll or self._poll_only:
+            return
+        poll = data.get("dps")
+        if isinstance(poll, dict):
+            self._api_protocol_working = True
+            self._api_working_protocol_failures = 0
+            self._process_received(dict(poll))
 
     def register_entity(self, entity):
         # If this is the first child entity to register, and HA is still
@@ -251,6 +353,8 @@ class TuyaLocalDevice(object):
             entity.async_schedule_update_ha_state(True)
 
     async def async_unregister_entity(self, entity):
+        if self.dev_cid and entity not in self._children:
+            return
         self._children.remove(entity)
         if not self._children:
             try:
@@ -262,42 +366,7 @@ class TuyaLocalDevice(object):
         """Coroutine wrapper for async_receive generator."""
         try:
             async for poll in self.async_receive():
-                if isinstance(poll, dict):
-                    _LOGGER.debug(
-                        "%s received %s",
-                        self.name,
-                        log_json(poll),
-                    )
-                    full_poll = poll.pop("full_poll", False)
-                    self._cached_state = self._cached_state | poll
-                    self._cached_state["updated_at"] = time()
-                    self._remove_properties_from_pending_updates(poll)
-
-                    for entity in self._children:
-                        # let entities trigger off poll contents directly
-                        try:
-                            entity.on_receive(poll, full_poll)
-                        except Exception as e:
-                            # Don't let exceptions thrown by the entities interrupt the communication loop
-                            # Just log them and move on.
-                            _LOGGER.exception(
-                                "%s on_receive error for entity %s: %s",
-                                self.name,
-                                entity.entity_id,
-                                e,
-                            )
-                        # clear non-persistant dps that were not in a full poll
-                        if full_poll:
-                            for dp in entity._config.dps():
-                                if not dp.persist and dp.id not in poll:
-                                    self._cached_state.pop(dp.id, None)
-                        entity.schedule_update_ha_state()
-                else:
-                    _LOGGER.debug(
-                        "%s received non data %s",
-                        self.name,
-                        log_json(poll),
-                    )
+                self._process_received(poll)
             _LOGGER.warning("%s receive loop has terminated", self.name)
 
         except Exception as t:
@@ -307,10 +376,50 @@ class TuyaLocalDevice(object):
         finally:
             # Ensure the persistent connection is closed when the loop exits
             # and device appears as unavailable
-            self._api.set_socketPersistent(False)
-            if self._api.parent:
-                self._api.parent.set_socketPersistent(False)
+            if not self.dev_cid:
+                self._api.set_socketPersistent(False)
+                if self._api.parent:
+                    self._api.parent.set_socketPersistent(False)
             self._reset_cached_state()
+
+    def _process_received(self, poll):
+        """Apply poll or push data on the event loop using the same entity semantics."""
+        if isinstance(poll, dict):
+            _LOGGER.debug(
+                "%s received %s",
+                self.name,
+                log_json(poll),
+            )
+            full_poll = poll.pop("full_poll", False)
+            self._cached_state = self._cached_state | poll
+            self._cached_state["updated_at"] = time()
+            self._remove_properties_from_pending_updates(poll)
+
+            for entity in self._children:
+                # let entities trigger off poll contents directly
+                try:
+                    entity.on_receive(poll, full_poll)
+                except Exception as e:
+                    # Don't let exceptions thrown by the entities interrupt the communication loop
+                    # Just log them and move on.
+                    _LOGGER.exception(
+                        "%s on_receive error for entity %s: %s",
+                        self.name,
+                        entity.entity_id,
+                        e,
+                    )
+                # clear non-persistant dps that were not in a full poll
+                if full_poll:
+                    for dp in entity._config.dps():
+                        if not dp.persist and dp.id not in poll:
+                            self._cached_state.pop(dp.id, None)
+                entity.schedule_update_ha_state()
+        else:
+            _LOGGER.debug(
+                "%s received non data %s",
+                self.name,
+                log_json(poll),
+            )
 
     @property
     def should_poll(self):
@@ -318,16 +427,24 @@ class TuyaLocalDevice(object):
 
     def pause(self):
         self._temporary_poll = True
-        _LOGGER.debug("%s pausing connection temporarily", self.name, False)
+        _LOGGER.debug("%s pausing connection temporarily", self.name)
+        if self.dev_cid:
+            return
         self._api.set_socketPersistent(False)
         if self._api.parent:
             self._api.parent.set_socketPersistent(False)
 
     def resume(self):
         self._temporary_poll = False
+        if self.dev_cid:
+            self._last_full_poll = 0
 
     async def async_receive(self):
         """Receive messages from a persistent connection asynchronously."""
+        if self.dev_cid:
+            async for poll in self._async_gateway_polls():
+                yield poll
+            return
         # If we didn't yet get any state from the device, we may need to
         # negotiate the protocol before making the connection persistent
         persist = not self.should_poll
@@ -472,6 +589,44 @@ class TuyaLocalDevice(object):
     def set_detected_product_id(self, product_id):
         self._product_ids.append(product_id)
 
+    async def _async_gateway_polls(self):
+        """Safety synchronization only; the broker receives all pushes."""
+        while self._running:
+            try:
+                if (
+                    not self._temporary_poll
+                    and time() - self._last_full_poll > self._CACHE_TIMEOUT
+                ):
+                    if self._force_dps and self._api_protocol_working:
+                        update = await self._retry_on_failed_connection(
+                            lambda: self._api.updatedps(self._force_dps),
+                            f"Failed to update device dps for {self.name}",
+                        )
+                        if isinstance(update, dict) and "Err" not in update:
+                            yield {**update.get("dps", update), "full_poll": False}
+                    poll = await self._retry_on_failed_connection(
+                        lambda: self._api.status(),
+                        f"Failed to fetch device status for {self.name}",
+                    )
+                    if (
+                        not self._closed
+                        and isinstance(poll, dict)
+                        and "Err" not in poll
+                    ):
+                        self._last_full_poll = time()
+                        yield {**poll.get("dps", poll), "full_poll": True}
+                    elif not self.has_returned_state:
+                        for entity in self._children:
+                            entity.async_schedule_update_ha_state()
+            except Exception:
+                if self._closed:
+                    return
+                _LOGGER.exception("%s gateway poll failed", self.name)
+                self._reset_cached_state()
+                for entity in self._children:
+                    entity.async_schedule_update_ha_state()
+            await asyncio.sleep(5 if not self.has_returned_state else 0.1)
+
     async def async_possible_types(self):
         cached_state = self._get_cached_state()
         if len(cached_state) <= 1:
@@ -481,18 +636,20 @@ class TuyaLocalDevice(object):
             # vendor specific dps start.  Between them, these three should cover
             # most devices.  148 covers a doorbell device that didn't have these
             # 201 covers remote controllers and 2 and 9 cover others without 1
-            self._api.set_dpsUsed(
-                {
-                    "1": None,
-                    "2": None,
-                    "9": None,
-                    "20": None,
-                    "60": None,
-                    "101": None,
-                    "148": None,
-                    "201": None,
-                }
-            )
+            dps = {
+                "1": None,
+                "2": None,
+                "9": None,
+                "20": None,
+                "60": None,
+                "101": None,
+                "148": None,
+                "201": None,
+            }
+            if self.dev_cid:
+                self._dps_to_request = dps
+            else:
+                self._api.set_dpsUsed(dps)
             await self.async_refresh()
             cached_state = self._get_cached_state()
 
@@ -531,10 +688,19 @@ class TuyaLocalDevice(object):
     async def async_refresh(self):
         _LOGGER.debug("Refreshing device state for %s", self.name)
         if not self._running:
-            await self._retry_on_failed_connection(
-                lambda: self._refresh_cached_state(),
-                f"Failed to refresh device state for {self.name}.",
-            )
+            if self.dev_cid:
+                poll = await self._retry_on_failed_connection(
+                    lambda: self._api.status(),
+                    f"Failed to refresh device state for {self.name}.",
+                )
+                if not self._closed and isinstance(poll, dict) and "Err" not in poll:
+                    self._last_full_poll = time()
+                    self._process_received({**poll.get("dps", {}), "full_poll": True})
+            else:
+                await self._retry_on_failed_connection(
+                    lambda: self._refresh_cached_state(),
+                    f"Failed to refresh device state for {self.name}.",
+                )
 
     def get_property(self, dps_id):
         cached_state = self._get_cached_state()
@@ -651,6 +817,21 @@ class TuyaLocalDevice(object):
             log_json(pending_properties),
         )
 
+        if self.dev_cid:
+            # Pending state belongs to the event loop, never to the I/O worker.
+            def send():
+                result = self._api.set_multiple_values(pending_properties, nowait=True)
+                if not isinstance(result, dict) or "Err" not in result:
+                    self._hass.loop.call_soon_threadsafe(
+                        self._mark_updates_sent, pending_properties
+                    )
+                return result
+
+            await self._retry_on_failed_connection(
+                send,
+                "Failed to update device state.",
+            )
+            return
         await self._retry_on_failed_connection(
             lambda: self._set_values(pending_properties),
             "Failed to update device state.",
@@ -658,14 +839,75 @@ class TuyaLocalDevice(object):
 
     def _set_values(self, properties):
         self._api.set_multiple_values(properties, nowait=True)
+        self._mark_updates_sent(properties)
+
+    def _mark_updates_sent(self, properties):
         now = time()
         self._last_connection = now
         pending_updates = self._get_pending_updates()
         for key in properties.keys():
-            pending_updates[key]["updated_at"] = now
-            pending_updates[key]["sent"] = True
+            if (
+                key in pending_updates
+                and pending_updates[key]["value"] == properties[key]
+            ):
+                pending_updates[key]["updated_at"] = now
+                pending_updates[key]["sent"] = True
 
     async def _retry_on_failed_connection(self, func, error_message):
+        if self.dev_cid:
+            return await self._async_gateway_retry(func, error_message)
+        return await self._retry_connection(func, error_message)
+
+    async def _async_gateway_retry(self, func, error_message):
+        await self._async_ensure_gateway()
+        gateway = self._gateway
+        try:
+            async with gateway.lock:
+                if self._closed:
+                    raise RuntimeError("Gateway child is stopped")
+                if not self._broker.running:
+                    await self._broker.async_start()
+                previous = (
+                    gateway.settings,
+                    gateway.protocol or gateway.parent.version,
+                    gateway.protocol_working,
+                    gateway.parent.address,
+                )
+                try:
+                    # A working gateway's negotiated version is shared by all
+                    # automatic children, so adding one cannot rotate siblings.
+                    if self._protocol_configured == "auto" and gateway.protocol_working:
+                        self._api_protocol_version_index = API_PROTOCOL_VERSIONS.index(
+                            gateway.protocol
+                        )
+                        self._api_protocol_working = True
+                    if self._api_protocol_version_index is None:
+                        await self._rotate_api_protocol_version()
+                    else:
+                        await self._async_configure_gateway()
+                    if self._dps_to_request:
+                        await self._broker.async_call(
+                            lambda: self._api.set_dpsUsed(self._dps_to_request)
+                        )
+                    result = await self._retry_connection(func, error_message)
+                    if self._test_device and self._api_protocol_working:
+                        self._protocol_configured = API_PROTOCOL_VERSIONS[
+                            self._api_protocol_version_index
+                        ]
+                    return result
+                finally:
+                    if self._test_device:
+                        await self._broker.async_call(
+                            lambda: gateway.configure(
+                                *previous[0], previous[1], resolved_address=previous[3]
+                            )
+                        )
+                        gateway.protocol_working = previous[2]
+        finally:
+            if self._test_device:
+                await self.async_release_gateway()
+
+    async def _retry_connection(self, func, error_message):
         if self._api_protocol_version_index is None:
             await self._rotate_api_protocol_version()
         auto = (self._protocol_configured == "auto") and (
@@ -687,8 +929,11 @@ class TuyaLocalDevice(object):
         for i in range(connections):
             try:
                 if not self._hass.is_stopping:
-                    async with self._api_lock:
-                        retval = await self._hass.async_add_executor_job(func)
+                    if self.dev_cid:
+                        retval = await self._broker.async_call(func)
+                    else:
+                        async with self._api_lock:
+                            retval = await self._hass.async_add_executor_job(func)
                     if isinstance(retval, dict) and "Error" in retval:
                         last_err_code = retval.get("Err")
                         last_err_msg = retval.get("Error")
@@ -703,6 +948,8 @@ class TuyaLocalDevice(object):
                             raise AttributeError(retval["Error"])
                     self._api_protocol_working = True
                     self._api_working_protocol_failures = 0
+                    if self.dev_cid:
+                        self._gateway.protocol_working = True
                     return retval
             except Exception as e:
                 _LOGGER.debug(
@@ -713,9 +960,14 @@ class TuyaLocalDevice(object):
                     connections,
                 )
                 # Ensure we have a fresh connection for the next attempt
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
+                if self.dev_cid:
+                    await self._broker.async_call(
+                        lambda: self._broker._disconnect("child request failed")
+                    )
+                else:
+                    self._api.set_socketPersistent(False)
+                    if self._api.parent:
+                        self._api.parent.set_socketPersistent(False)
 
                 if i + 1 == connections:
                     self._reset_cached_state()
@@ -725,6 +977,8 @@ class TuyaLocalDevice(object):
                         > self._AUTO_FAILURE_RESET_COUNT
                     ):
                         self._api_protocol_working = False
+                        if self.dev_cid:
+                            self._gateway.protocol_working = False
                         for entity in self._children:
                             entity.async_schedule_update_ha_state()
                     if last_err_code:
@@ -794,6 +1048,9 @@ class TuyaLocalDevice(object):
             self._api_protocol_version_index = 0
 
         new_version = API_PROTOCOL_VERSIONS[self._api_protocol_version_index]
+        if self.dev_cid:
+            await self._async_configure_gateway()
+            return
         _LOGGER.debug(
             "Setting protocol version for %s to %s",
             self.name,
@@ -830,6 +1087,18 @@ class TuyaLocalDevice(object):
                 self._api.parent.set_version,
                 new_version,
             )
+
+    async def _async_configure_gateway(self):
+        settings = (
+            self._gateway_settings
+            if self._test_device or self._gateway_configure_pending
+            else self._gateway.settings
+        )
+        version = API_PROTOCOL_VERSIONS[self._api_protocol_version_index]
+        await self._broker.async_call(
+            lambda: self._gateway.configure(*settings, version)
+        )
+        self._gateway_configure_pending = False
 
     @staticmethod
     def get_key_for_value(obj, value, fallback=None):
@@ -881,5 +1150,5 @@ async def async_delete_device(hass: HomeAssistant, config: dict):
     # Platform setup may cache entity instances in this bucket by config_id.
     # Only drop empty buckets here; async_unload_entry removes the whole bucket
     # after forwarded platform unloads complete.
-    if not device_entry:
+    if not device_entry and domain_data.get(device_id) is device_entry:
         domain_data.pop(device_id, None)

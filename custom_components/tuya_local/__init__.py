@@ -8,6 +8,7 @@ https://github.com/codetheweb/tuyapi/issues/31.
 """
 
 import logging
+from asyncio import CancelledError
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
@@ -86,6 +87,18 @@ def cleanup_failed_device(hass: HomeAssistant, device_id: str):
         api.set_socketPersistent(False)
         if api.parent:
             api.parent.set_socketPersistent(False)
+
+
+async def async_cleanup_failed_device(hass, config):
+    if config.get(CONF_DEVICE_CID):
+        domain_data = hass.data.get(DOMAIN, {})
+        device_id = get_device_id(config)
+        bucket = domain_data.get(device_id)
+        await async_delete_device(hass, config)
+        if domain_data.get(device_id) is bucket:
+            domain_data.pop(device_id, None)
+    else:
+        cleanup_failed_device(hass, get_device_id(config))
 
 
 async def async_migrate_entry(hass, entry: ConfigEntry):
@@ -1099,33 +1112,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     await async_start_discovery(hass)
     config = {**entry.data, **entry.options, "name": entry.title}
     try:
-        device = await hass.async_add_executor_job(setup_device, hass, config)
+        if config.get(CONF_DEVICE_CID):
+            device = setup_device(hass, config)
+        else:
+            device = await hass.async_add_executor_job(setup_device, hass, config)
         await device.async_refresh()
 
+    except CancelledError:
+        await async_cleanup_failed_device(hass, config)
+        raise
     except Exception as e:
-        cleanup_failed_device(hass, device_id)
+        await async_cleanup_failed_device(hass, config)
         raise ConfigEntryNotReady("tuya-local device not ready") from e
 
     if not device.has_returned_state:
-        cleanup_failed_device(hass, device_id)
+        await async_cleanup_failed_device(hass, config)
         raise ConfigEntryNotReady("tuya-local device offline")
 
-    device_conf = await hass.async_add_executor_job(
-        get_config,
-        entry.data[CONF_TYPE],
-    )
-    if device_conf is None:
-        _LOGGER.error(NOT_FOUND, config[CONF_TYPE])
-        return False
+    try:
+        device_conf = await hass.async_add_executor_job(
+            get_config,
+            entry.data[CONF_TYPE],
+        )
+        if device_conf is None:
+            _LOGGER.error(NOT_FOUND, config[CONF_TYPE])
+            await async_cleanup_failed_device(hass, config)
+            return False
 
-    entities = set()
-    for e in device_conf.all_entities():
-        entities.add(e.entity)
-
-    await hass.config_entries.async_forward_entry_setups(entry, entities)
-    await async_setup_services(hass, entities)
-
-    entry.add_update_listener(async_update_entry)
+        entities = {e.entity for e in device_conf.all_entities()}
+        await hass.config_entries.async_forward_entry_setups(entry, entities)
+        await async_setup_services(hass, entities)
+        entry.async_on_unload(entry.add_update_listener(async_update_entry))
+    except BaseException:
+        await async_cleanup_failed_device(hass, config)
+        raise
 
     return True
 
@@ -1157,7 +1177,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
         await hass.config_entries.async_forward_entry_unload(entry, e)
 
     await async_delete_device(hass, config)
-    domain_data.pop(device_id, None)
+    if domain_data.get(device_id) is data:
+        domain_data.pop(device_id, None)
 
     # Stop the shared rediscovery sweeper once the last device is gone.
     remaining = [

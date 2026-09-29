@@ -675,12 +675,15 @@ def create_test_device(hass: HomeAssistant, config: dict):
         subdevice_id,
         hass,
         True,
+        temporary=True,
     )
 
     return device
 
 
 async def async_test_connection(config: dict, hass: HomeAssistant):
+    if config.get(CONF_DEVICE_CID):
+        return await async_test_gateway_connection(config, hass)
     domain_data = hass.data.get(DOMAIN)
     existing = domain_data.get(get_device_id(config)) if domain_data else None
     if existing and existing.get("device"):
@@ -729,6 +732,28 @@ async def async_test_connection(config: dict, hass: HomeAssistant):
         existing["device"].resume()
 
     return retval
+
+
+async def async_test_gateway_connection(config: dict, hass: HomeAssistant):
+    """Probe through the existing owner and restore shared settings afterwards."""
+    existing = hass.data.get(DOMAIN, {}).get(get_device_id(config), {}).get("device")
+    device = None
+    if existing:
+        existing.pause()
+    try:
+        # Gateway retry/negotiation runs under a shared lock. Each temporary
+        # request releases its lease, so abandoned UI flows cannot leak sockets.
+        device = create_test_device(hass, config)
+        await device.async_refresh()
+        return device if device.has_returned_state else None
+    except Exception as exc:
+        _LOGGER.warning("Gateway connection test failed with %s %s", type(exc), exc)
+        return None
+    finally:
+        if device is not None:
+            await device.async_release_gateway()
+        if existing:
+            existing.resume()
 
 
 def scan_for_device(devid):
