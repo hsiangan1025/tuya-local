@@ -1,6 +1,7 @@
 """Gateway integration regressions with synthetic devices and no network I/O."""
 
 import asyncio
+import hmac
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -10,6 +11,14 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.exceptions import ConfigEntryNotReady
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from tinytuya import Device as TinyTuyaDevice
+from tinytuya.core import (
+    DP_QUERY_NEW,
+    SESS_KEY_NEG_FINISH,
+    SESS_KEY_NEG_RESP,
+    SESS_KEY_NEG_START,
+    AESCipher,
+    TuyaMessage,
+)
 
 from custom_components.tuya_local import async_setup_entry
 from custom_components.tuya_local.config_flow import async_test_connection
@@ -231,17 +240,90 @@ async def test_safety_poll_not_reset_by_pushes(gateway_env, mocker):
     child = gateway_env()
     await child.async_refresh()
     clock = mocker.patch("custom_components.tuya_local.device.time", return_value=100)
-    child._last_full_poll = 70
-    child._gateway_receive({"dps": {"1": True}})
-    child._running = True
-    polls = child.async_receive()
-    task = asyncio.create_task(anext(polls))
+    loop = asyncio.get_running_loop()
+    monotonic = loop.time
+    offset = 0
+    mocker.patch.object(loop, "time", side_effect=lambda: monotonic() + offset)
+    child._last_full_poll = 100
+    child.actually_start()
+
+    def statuses():
+        return sum(c[0] == "status" for c in child._api.calls)
+
     await asyncio.sleep(0.02)
-    assert not task.done()
-    clock.return_value = 101
-    assert (await asyncio.wait_for(task, 2))["full_poll"]
-    child._running = False
-    await polls.aclose()
+    assert statuses() == 1
+    offset = 29
+    clock.return_value = 129
+    child._api.parent.pushes.append({"device": child._api, "dps": {"1": True}})
+    await eventually(lambda: child.get_property("1") is True)
+    assert statuses() == 1 and child._last_full_poll == 100
+    offset = 30
+    clock.return_value = 130
+    await eventually(lambda: child._last_full_poll == 130)
+    assert statuses() == 2
+    offset = 59
+    clock.return_value = 159
+    await asyncio.sleep(0.02)
+    assert statuses() == 2
+    offset = 60
+    clock.return_value = 160
+    await eventually(lambda: child._last_full_poll == 160)
+    assert statuses() == 3
+    await child.async_stop()
+
+
+async def test_healthy_poll_wait_is_idle_and_pushes_are_immediate(gateway_env, mocker):
+    child = gateway_env()
+    await child.async_refresh()
+    clock = mocker.patch("custom_components.tuya_local.device.time", return_value=100)
+    child._last_full_poll = 100
+    child.actually_start()
+    await asyncio.sleep(0.02)
+    clock_calls = clock.call_count
+    await asyncio.sleep(0.35)
+    assert clock.call_count == clock_calls
+    child._api.parent.pushes.append({"device": child._api, "dps": {"1": True}})
+    await eventually(lambda: child.get_property("1") is True)
+    assert sum(c[0] == "status" for c in child._api.calls) == 1
+    assert child._last_full_poll == 100
+    await child.async_stop()
+    assert child._refresh_task is None
+
+
+async def test_resume_wakes_full_safety_poll_promptly(gateway_env):
+    child = gateway_env()
+    await child.async_refresh()
+    child.actually_start()
+    await asyncio.sleep(0.02)
+    child.pause()
+    await asyncio.sleep(0.02)
+    assert sum(c[0] == "status" for c in child._api.calls) == 1
+    child._api.responses.append({"dps": {"1": True}})
+    child.resume()
+    await eventually(lambda: child.get_property("1") is True)
+    assert sum(c[0] == "status" for c in child._api.calls) == 2
+    await child.async_stop()
+
+
+async def test_uninitialized_poll_retries_after_five_seconds(gateway_env, mocker):
+    child = gateway_env()
+    await child._async_ensure_gateway()
+    child._api.responses.extend([RuntimeError("offline")] * 3)
+    loop = asyncio.get_running_loop()
+    monotonic = loop.time
+    offset = 0
+    mocker.patch.object(loop, "time", side_effect=lambda: monotonic() + offset)
+    wait = mocker.spy(child._gateway_poll_event, "wait")
+    child.actually_start()
+    await eventually(lambda: wait.call_count == 1)
+    offset = 4
+    await asyncio.sleep(0.02)
+    assert not child.has_returned_state
+    assert sum(c[0] == "status" for c in child._api.calls) == 3
+    offset = 5
+    await eventually(lambda: child.has_returned_state)
+    assert sum(c[0] == "status" for c in child._api.calls) == 4
+    await child.async_stop()
 
 
 async def test_wrong_cid_tuple_dispatched_without_extra_receive(gateway_env):
@@ -316,6 +398,115 @@ async def test_first_setup_failure_removes_gateway(hass, gateway_env, mocker):
         await async_setup_entry(hass, entry)
     assert not get_gateway_registry(hass).gateways
     assert "gateway-test/child-a" not in hass.data[DOMAIN]
+
+
+@pytest.mark.parametrize("failure", ["error", "no_state", "cancel", "configure"])
+async def test_failed_new_child_restores_shared_transport(
+    hass, gateway_env, mocker, failure
+):
+    sibling = gateway_env("sibling")
+    await sibling.async_refresh()
+    gateway, broker, parent = sibling._gateway, sibling._broker, sibling._api.parent
+    entered, release = threading.Event(), threading.Event()
+    original_status = FakeAPI.status
+
+    def status(api):
+        if api.cid != "failed":
+            return original_status(api)
+        api.record("status")
+        if failure == "cancel":
+            entered.set()
+            assert release.wait(3)
+        if failure == "no_state":
+            return None
+        return {"Err": "914", "Error": "synthetic failure"}
+
+    mocker.patch.object(FakeAPI, "status", new=status)
+    if failure == "configure":
+        original_version = parent.set_version
+
+        def set_version(version):
+            original_version(version)
+            if version == 3.4:
+                raise RuntimeError("configuration interrupted")
+
+        mocker.patch.object(parent, "set_version", side_effect=set_version)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Failed child",
+        data=config(
+            "failed",
+            host="failed.invalid",
+            local_key="synthetic-key-02",
+            protocol_version=3.4,
+        ),
+    )
+    setup = asyncio.create_task(async_setup_entry(hass, entry))
+    if failure == "cancel":
+        await eventually(entered.is_set)
+        setup.cancel()
+        release.set()
+    with pytest.raises((ConfigEntryNotReady, RuntimeError, asyncio.CancelledError)):
+        await setup
+    assert gateway.settings == ("gateway.invalid", "synthetic-key-01")
+    assert gateway.protocol == parent.version == sibling._api.version == 3.3
+    assert gateway.protocol_working
+    assert parent.address == "gateway.invalid"
+    assert parent.local_key == parent.real_local_key == b"synthetic-key-01"
+    assert parent.children == {"sibling": sibling._api}
+    assert broker.child_count == len(gateway.members) == 1
+    assert "gateway-test/failed" not in hass.data[DOMAIN]
+    await sibling.async_refresh()
+    await sibling.async_set_property("1", True)
+    assert sibling.has_returned_state
+    assert sibling._gateway is gateway and sibling._broker is broker
+    assert sibling._api.parent is parent
+    assert len({c[2] for api in FakeAPI.instances for c in api.calls}) == 1
+
+
+async def test_successful_new_child_keeps_shared_transport(gateway_env):
+    sibling = gateway_env("sibling", protocol_version="auto")
+    await sibling.async_refresh()
+    child = gateway_env(
+        host="replacement.invalid", local_key="synthetic-key-02", protocol_version=3.4
+    )
+    await child.async_refresh()
+    gateway, parent = sibling._gateway, sibling._api.parent
+    assert child.has_returned_state
+    assert gateway.settings == ("replacement.invalid", "synthetic-key-02")
+    assert gateway.protocol == parent.version == 3.4
+    assert parent.address == "replacement.invalid"
+    assert parent.local_key == parent.real_local_key == b"synthetic-key-02"
+    await child.async_stop()
+    await sibling.async_refresh()
+    await sibling.async_set_property("1", True)
+    assert parent.version == 3.4
+    assert parent.address == "replacement.invalid"
+
+
+async def test_reachable_error_900_keeps_new_shared_settings(gateway_env):
+    sibling = gateway_env("sibling")
+    await sibling.async_refresh()
+    child = gateway_env(host="replacement.invalid", protocol_version=3.4)
+    await child._async_ensure_gateway()
+    child._api.responses.append({"Err": "900", "Error": "no status data"})
+    await child.async_refresh()
+    assert child.has_returned_state
+    assert child._gateway.protocol_working
+    assert child._api.parent.address == "replacement.invalid"
+    assert child._api.parent.version == 3.4
+    await child.async_set_property("1", True)
+    assert child._api.parent.address == "replacement.invalid"
+
+
+async def test_runtime_failures_can_still_reset_working_protocol(gateway_env):
+    child = gateway_env(protocol_version="auto")
+    await child.async_refresh()
+    child._api_working_protocol_failures = child._AUTO_FAILURE_RESET_COUNT
+    child._api.responses.extend([RuntimeError("synthetic failure")] * 3)
+    await child.async_refresh()
+    assert not child._api_protocol_working
+    assert not child._gateway.protocol_working
 
 
 async def test_pause_probe_resume_uses_same_owner_and_restores_settings(
@@ -766,6 +957,83 @@ async def test_real_tinytuya_registration_and_version_io_stay_on_owner(
     assert parent.children == {"child-b": second._api}
     await second.async_refresh()
     assert second.has_returned_state
+
+
+@pytest.mark.parametrize("working_version", [3.4, 3.5])
+async def test_real_tinytuya_auto_rotation_resets_protocol_and_session(
+    gateway_env, mocker, working_version
+):
+    """Keep real status, payload generation and cryptographic negotiation."""
+    attempts, negotiations, owners = [], [], set()
+    remote_nonce = b"test-remote-0001"
+    stale_nonce = b"stale-nonce-0001"
+
+    def exchange_key(api, payload, recv_retries):
+        owners.add(threading.current_thread())
+        if payload.cmd == SESS_KEY_NEG_START:
+            negotiations.append(
+                (api.version, api.local_key, api.local_nonce, api.remote_nonce)
+            )
+            if api.version != working_version:
+                api.local_key = b"stale-key-000001"
+                api.remote_nonce = stale_nonce
+                return None
+            reply = remote_nonce + hmac.digest(
+                api.real_local_key, payload.payload, "sha256"
+            )
+            if api.version == 3.4:
+                reply = AESCipher(api.real_local_key).encrypt(reply, use_base64=False)
+            return TuyaMessage(1, SESS_KEY_NEG_RESP, 0, reply, 0)
+        assert payload.cmd == SESS_KEY_NEG_FINISH
+        assert payload.payload == hmac.digest(
+            api.real_local_key, remote_nonce, "sha256"
+        )
+        return None
+
+    def exchange_status(api, payload, *args, **kwargs):
+        owners.add(threading.current_thread())
+        attempts.append((api.version, api.dev_type, payload.cmd))
+        parent = api.parent or api
+        if api.version >= 3.4:
+            if parent._negotiate_session_key():
+                return {"dps": {"1": True}}
+        else:
+            parent.local_nonce = stale_nonce
+            parent.remote_nonce = stale_nonce
+        return {"Err": "914", "Error": "synthetic protocol failure"}
+
+    mocker.patch("tinytuya.Device", TinyTuyaDevice)
+    mocker.patch.object(TinyTuyaDevice, "_send_receive", new=exchange_status)
+    mocker.patch.object(TinyTuyaDevice, "_send_receive_quick", new=exchange_key)
+    mocker.patch.object(GatewayBroker, "_ensure_connected")
+    child = gateway_env(protocol_version="auto")
+    await child.async_refresh()
+    parent, broker = child._api.parent, child._broker
+    # 3.2 also calls status internally to discover DPS; collapse repeats.
+    assert list(dict.fromkeys(attempt[0] for attempt in attempts)) == (
+        [3.3, 3.1, 3.2, 3.4] + ([3.5] if working_version == 3.5 else [])
+    )
+    assert child.has_returned_state
+    assert attempts[-1] == (working_version, "default", DP_QUERY_NEW)
+    for api in (parent, child._api):
+        assert api.version == working_version
+        assert api.version_str == f"v{working_version}"
+        assert api.version_bytes == str(working_version).encode()
+        assert api.version_header.startswith(api.version_bytes)
+        assert api.dev_type == "default"
+    assert negotiations
+    for _, key, nonce, remote in negotiations:
+        assert key == b"synthetic-key-01"
+        assert nonce != stale_nonce and len(nonce) == 16
+        assert remote == b""
+    assert parent.remote_nonce == remote_nonce
+    assert len(parent.local_key) == 16 and parent.local_key != parent.real_local_key
+    previous_nonce = parent.local_nonce
+    await child.async_refresh()
+    assert parent.local_nonce != previous_nonce
+    assert child._api.parent is parent and child._broker is broker
+    assert len(owners) == 1
+    assert next(iter(owners)).name == "tuya-local-gateway"
 
 
 async def test_worker_start_failure_cleans_registry(hass, gateway_env, mocker):

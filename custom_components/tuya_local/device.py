@@ -102,6 +102,7 @@ class TuyaLocalDevice(object):
         self._test_device = temporary
         self._dps_to_request = None
         self._gateway_configure_pending = True
+        self._gateway_poll_event = asyncio.Event()
         try:
             if dev_cid:
                 # Acquire asynchronously on first use. Constructors run in HA's
@@ -429,6 +430,7 @@ class TuyaLocalDevice(object):
         self._temporary_poll = True
         _LOGGER.debug("%s pausing connection temporarily", self.name)
         if self.dev_cid:
+            self._gateway_poll_event.set()
             return
         self._api.set_socketPersistent(False)
         if self._api.parent:
@@ -438,6 +440,7 @@ class TuyaLocalDevice(object):
         self._temporary_poll = False
         if self.dev_cid:
             self._last_full_poll = 0
+            self._gateway_poll_event.set()
 
     async def async_receive(self):
         """Receive messages from a persistent connection asynchronously."""
@@ -592,10 +595,12 @@ class TuyaLocalDevice(object):
     async def _async_gateway_polls(self):
         """Safety synchronization only; the broker receives all pushes."""
         while self._running:
+            self._gateway_poll_event.clear()
+            poll_failed = False
             try:
                 if (
                     not self._temporary_poll
-                    and time() - self._last_full_poll > self._CACHE_TIMEOUT
+                    and time() - self._last_full_poll >= self._CACHE_TIMEOUT
                 ):
                     if self._force_dps and self._api_protocol_working:
                         update = await self._retry_on_failed_connection(
@@ -615,17 +620,33 @@ class TuyaLocalDevice(object):
                     ):
                         self._last_full_poll = time()
                         yield {**poll.get("dps", poll), "full_poll": True}
-                    elif not self.has_returned_state:
-                        for entity in self._children:
-                            entity.async_schedule_update_ha_state()
+                    else:
+                        poll_failed = True
+                        if not self.has_returned_state:
+                            for entity in self._children:
+                                entity.async_schedule_update_ha_state()
             except Exception:
                 if self._closed:
                     return
                 _LOGGER.exception("%s gateway poll failed", self.name)
                 self._reset_cached_state()
+                poll_failed = True
                 for entity in self._children:
                     entity.async_schedule_update_ha_state()
-            await asyncio.sleep(5 if not self.has_returned_state else 0.1)
+            # Pushes update the cache independently. Only the full-poll deadline
+            # or a pause/resume transition needs to wake this coroutine.
+            delay = None
+            if not self._temporary_poll:
+                delay = (
+                    5
+                    if poll_failed or not self.has_returned_state
+                    else max(0, self._last_full_poll + self._CACHE_TIMEOUT - time())
+                )
+            try:
+                async with asyncio.timeout(delay):
+                    await self._gateway_poll_event.wait()
+            except TimeoutError:
+                pass
 
     async def async_possible_types(self):
         cached_state = self._get_cached_state()
@@ -873,6 +894,19 @@ class TuyaLocalDevice(object):
                     gateway.protocol_working,
                     gateway.parent.address,
                 )
+                configuration_pending = self._gateway_configure_pending
+                succeeded = False
+
+                def request_succeeded(result):
+                    nonlocal succeeded
+                    # A first status returning None cannot establish an entry.
+                    # A reachable error-900 device or a nowait control can.
+                    succeeded = (
+                        not configuration_pending
+                        or isinstance(result, dict)
+                        or self.has_returned_state
+                    )
+
                 try:
                     # A working gateway's negotiated version is shared by all
                     # automatic children, so adding one cannot rotate siblings.
@@ -889,25 +923,47 @@ class TuyaLocalDevice(object):
                         await self._broker.async_call(
                             lambda: self._api.set_dpsUsed(self._dps_to_request)
                         )
-                    result = await self._retry_connection(func, error_message)
+                    result = await self._retry_connection(
+                        func, error_message, on_success=request_succeeded
+                    )
                     if self._test_device and self._api_protocol_working:
                         self._protocol_configured = API_PROTOCOL_VERSIONS[
                             self._api_protocol_version_index
                         ]
                     return result
                 finally:
-                    if self._test_device:
+                    changed = (
+                        gateway.settings != previous[0]
+                        or gateway.protocol != previous[1]
+                        or gateway.parent.address != previous[3]
+                    )
+                    if self._test_device or (
+                        not succeeded and (configuration_pending or changed)
+                    ):
                         await self._broker.async_call(
                             lambda: gateway.configure(
-                                *previous[0], previous[1], resolved_address=previous[3]
+                                *previous[0],
+                                previous[1],
+                                resolved_address=previous[3],
+                                # Also repair a configure() interrupted before
+                                # it could publish its new settings/version.
+                                force=not succeeded,
                             )
                         )
-                        gateway.protocol_working = previous[2]
+                        gateway.protocol_working = previous[2] and (
+                            configuration_pending
+                            or self._test_device
+                            or self._api_working_protocol_failures
+                            <= self._AUTO_FAILURE_RESET_COUNT
+                        )
+                        self._gateway_configure_pending = configuration_pending
+                        if not succeeded:
+                            self._api_protocol_working = False
         finally:
             if self._test_device:
                 await self.async_release_gateway()
 
-    async def _retry_connection(self, func, error_message):
+    async def _retry_connection(self, func, error_message, *, on_success=None):
         if self._api_protocol_version_index is None:
             await self._rotate_api_protocol_version()
         auto = (self._protocol_configured == "auto") and (
@@ -950,6 +1006,8 @@ class TuyaLocalDevice(object):
                     self._api_working_protocol_failures = 0
                     if self.dev_cid:
                         self._gateway.protocol_working = True
+                    if on_success is not None:
+                        on_success(retval)
                     return retval
             except Exception as e:
                 _LOGGER.debug(

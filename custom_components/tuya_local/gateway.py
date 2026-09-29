@@ -39,10 +39,12 @@ class GatewayConnection:
         self.protocol = None
         self.protocol_working = False
 
-    def configure(self, address, local_key, protocol, *, resolved_address=None):
+    def configure(
+        self, address, local_key, protocol, *, resolved_address=None, force=False
+    ):
         """Apply transport settings on the owner thread, including session reset."""
         settings = (address, local_key)
-        if settings != self.settings or protocol != self.protocol:
+        if force or settings != self.settings or protocol != self.protocol:
             self.parent.set_socketPersistent(False)
             self.parent.received_wrong_cid_queue.clear()
             self.parent.auto_ip = not address or address in _AUTO_ADDRESSES
@@ -53,9 +55,16 @@ class GatewayConnection:
             self.parent.local_key = local_key.encode("latin1")
             self.parent.real_local_key = self.parent.local_key
             version = {3.22: 3.3, 3.42: 3.4, 3.52: 3.5}.get(protocol, protocol)
+            # TinyTuya sets device22 on 3.2 but never resets it on later
+            # versions; that overrides 3.4/3.5's status command. Reset only
+            # when changing protocols, preserving detection within a version.
+            if protocol != self.protocol or version != self.parent.version:
+                self.parent.dev_type = "default"
             self.parent.set_version(version)
             for api in self.apis.values():
                 api.disabledetect = protocol not in (3.22, 3.42, 3.52)
+                if protocol != self.protocol or version != api.version:
+                    api.dev_type = "default"
                 api.set_version(version)
             self.settings = settings
             self.protocol = protocol
