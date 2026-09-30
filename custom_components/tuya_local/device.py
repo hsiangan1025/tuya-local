@@ -103,6 +103,7 @@ class TuyaLocalDevice(object):
         self._dps_to_request = None
         self._gateway_configure_pending = True
         self._gateway_poll_event = asyncio.Event()
+        self._command_lock = asyncio.Lock()
         try:
             if dev_cid:
                 # Acquire asynchronously on first use. Constructors run in HA's
@@ -788,6 +789,15 @@ class TuyaLocalDevice(object):
         if len(properties) == 0:
             return
 
+        if self.dev_cid:
+            # Keep each child's pending state, debounce and retry lifecycle
+            # together. A later command must not snapshot an earlier command's
+            # unsent values or be acknowledged/cleared by its completion.
+            async with self._command_lock:
+                self._add_properties_to_pending_updates(properties)
+                await self._debounce_sending_updates()
+            return
+
         self._add_properties_to_pending_updates(properties)
         await self._debounce_sending_updates()
 
@@ -840,11 +850,15 @@ class TuyaLocalDevice(object):
 
         if self.dev_cid:
             # Pending state belongs to the event loop, never to the I/O worker.
+            submitted_updates = {
+                key: self._pending_updates[key] for key in pending_properties
+            }
+
             def send():
                 result = self._api.set_multiple_values(pending_properties, nowait=True)
                 if not isinstance(result, dict) or "Err" not in result:
                     self._hass.loop.call_soon_threadsafe(
-                        self._mark_updates_sent, pending_properties
+                        self._mark_updates_sent, pending_properties, submitted_updates
                     )
                 return result
 
@@ -862,7 +876,7 @@ class TuyaLocalDevice(object):
         self._api.set_multiple_values(properties, nowait=True)
         self._mark_updates_sent(properties)
 
-    def _mark_updates_sent(self, properties):
+    def _mark_updates_sent(self, properties, submitted_updates=None):
         now = time()
         self._last_connection = now
         pending_updates = self._get_pending_updates()
@@ -870,6 +884,12 @@ class TuyaLocalDevice(object):
             if (
                 key in pending_updates
                 and pending_updates[key]["value"] == properties[key]
+                # An in-flight call can finish after its coroutine was
+                # cancelled and a newer command acquired the command lock.
+                and (
+                    submitted_updates is None
+                    or pending_updates[key] is submitted_updates.get(key)
+                )
             ):
                 pending_updates[key]["updated_at"] = now
                 pending_updates[key]["sent"] = True
