@@ -299,7 +299,7 @@ async def test_trace_sink_failure_does_not_change_command_behavior(gateway_env, 
     await child.async_stop()
 
 
-async def test_select_timeouts_and_successful_heartbeats_are_not_traced(
+async def test_normal_selects_are_quiet_and_due_heartbeats_have_pairs(
     gateway_env, caplog
 ):
     child = gateway_env()
@@ -307,8 +307,14 @@ async def test_select_timeouts_and_successful_heartbeats_are_not_traced(
     child._broker._heartbeat_interval = 0
     caplog.clear()
     await asyncio.sleep(0.03)
+    await child.async_stop()
     assert any(c[0] == "heartbeat" for c in child._api.parent.calls)
-    assert not records(caplog)
+    events = records(caplog)
+    starts = [e for e in events if e["event"] == "heartbeat_start"]
+    dones = [e for e in events if e["event"] == "heartbeat_done"]
+    assert starts and len(starts) == len(dones)
+    assert all(e["outcome"] == "ok" for e in dones)
+    assert not any(e["event"] == "select_slow" for e in events)
 
 
 async def test_poll_retries_are_not_counted_as_command_retries(gateway_env, caplog):

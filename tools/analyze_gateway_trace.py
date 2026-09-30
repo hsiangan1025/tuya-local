@@ -33,15 +33,26 @@ EVENTS = set(
     "tuya_send_result cmd_complete retry mark_sent stale_mark_sent_ignored "
     "pending_expire ack_timeout push_rx push_dispatch push_ack poll_due "
     "poll_start poll_done poll_error disconnect reconnect worker_failure "
-    "broker_drain_start broker_drain_done health".split()
+    "broker_drain_start broker_drain_done health connect_start connect_done "
+    "heartbeat_start heartbeat_done receive_start receive_done select_slow".split()
 )
 IDS = set(
-    "run_id seq gateway_slot child_slot cmd_id poll_id call_id lock_id batch_id push_id pending_generation pending_cmd_id".split()
+    "run_id seq gateway_slot child_slot cmd_id poll_id call_id lock_id batch_id push_id phase_id pending_generation pending_cmd_id".split()
 )
 COUNTS = set(
-    "dp_count pending_count remaining_pending_count attempt calls_executed queue_depth_after broker_queue_depth broker_pending_futures registered_children gateway_members".split()
+    "dp_count pending_count remaining_pending_count attempt calls_executed queue_depth_after broker_queue_depth broker_pending_futures registered_children gateway_members socket_retry_limit".split()
 )
-TIMES = set("ts_ms duration_ms wait_ms ack_latency_ms".split())
+CONFIG_FIELDS = {
+    "socket_timeout_ms",
+    "socket_retry_limit",
+    "socket_retry_delay_ms",
+    "heartbeat_interval_ms",
+    "select_timeout_ms",
+}
+TIMES = set("ts_ms start_ts_ms duration_ms wait_ms ack_latency_ms".split()) | (
+    CONFIG_FIELDS - {"socket_retry_limit"}
+)
+WORKER_PHASES = ("connect", "heartbeat", "receive")
 ENUMS = {
     "outcome": {"ok", "error", "cancelled", "stopped"},
     "source": {"socket", "cache"},
@@ -51,9 +62,13 @@ ENUMS = {
 
 SCHEMA = json.loads(Path(__file__).with_name("gateway_trace_schema.json").read_text())
 REQUIRED = {event: set(SCHEMA["required"]) for event in EVENTS}
+EVENT_ENUMS = defaultdict(dict)
 for rule in SCHEMA["allOf"]:
     for event in rule["if"]["properties"]["event"]["enum"]:
         REQUIRED[event].update(rule["then"]["required"])
+        for field, constraint in rule["then"].get("properties", {}).items():
+            if "enum" in constraint:
+                EVENT_ENUMS[event][field] = set(constraint["enum"])
 
 
 def parse(lines):
@@ -105,6 +120,11 @@ def parse(lines):
             continue
         if not REQUIRED[clean["event"]] <= clean.keys():
             continue
+        if any(
+            clean.get(field) not in allowed
+            for field, allowed in EVENT_ENUMS[clean["event"]].items()
+        ):
+            continue
         identity = clean["run_id"], clean["seq"]
         if identity in seen:
             continue
@@ -130,6 +150,159 @@ def distribution(values):
         "p99": percentile(0.99),
         "max": round(values[-1], 6),
     }
+
+
+def worker_observations(events, fail):
+    """Correlate observed owner phases with queue waits, without guessing gaps."""
+    groups = defaultdict(list)
+    calls = defaultdict(list)
+    intervals = []
+    for event in events:
+        if "phase_id" in event:
+            groups[event["run_id"], event["phase_id"]].append(event)
+        if "call_id" in event:
+            calls[event["run_id"], event["call_id"]].append(event)
+
+    def interval(start, end, phase, **identity):
+        return {
+            "run_id": start["run_id"],
+            "gateway_slot": start["gateway_slot"],
+            "phase": phase,
+            **identity,
+            "start_seq": start["seq"],
+            "end_seq": end["seq"] if end else None,
+            "start_ts_ms": start["ts_ms"],
+            "end_ts_ms": end["ts_ms"] if end else None,
+            "duration_ms": end.get("duration_ms") if end else None,
+            "outcome": end.get("outcome") if end else None,
+        }
+
+    for chain in groups.values():
+        start = chain[0]
+        phase = start["event"].removesuffix("_start")
+        if phase not in WORKER_PHASES:
+            fail("malformed_worker_phase")
+            continue
+        if len(chain) == 1:
+            fail("unfinished_worker_phase")
+            intervals.append(interval(start, None, phase, phase_id=start["phase_id"]))
+            continue
+        end = chain[-1]
+        if (
+            len(chain) != 2
+            or end["event"] != phase + "_done"
+            or end["gateway_slot"] != start["gateway_slot"]
+            or end["ts_ms"] < start["ts_ms"]
+        ):
+            fail("malformed_worker_phase")
+            continue
+        intervals.append(interval(start, end, phase, phase_id=start["phase_id"]))
+
+    for event in events:
+        if event["event"] == "select_slow":
+            if event["start_ts_ms"] > event["ts_ms"]:
+                fail("malformed_select_interval")
+                continue
+            span = interval(event, event, "select")
+            span["start_ts_ms"] = event["start_ts_ms"]
+            intervals.append(span)
+    # Another queued broker call can also occupy the single worker.
+    for chain in calls.values():
+        starts = [e for e in chain if e["event"] == "broker_execute_start"]
+        ends = [e for e in chain if e["event"] == "broker_execute_done"]
+        if len(starts) == len(ends) == 1:
+            start, end = starts[0], ends[0]
+            if (
+                start["seq"] < end["seq"]
+                and start["ts_ms"] <= end["ts_ms"]
+                and start["gateway_slot"] == end["gateway_slot"]
+            ):
+                intervals.append(
+                    interval(start, end, "broker_execute", call_id=start["call_id"])
+                )
+
+    intervals.sort(key=lambda e: (e["run_id"], e["start_ts_ms"], e["start_seq"]))
+    by_gateway = defaultdict(list)
+    for span in intervals:
+        if span["end_ts_ms"] is not None:
+            by_gateway[span["run_id"], span["gateway_slot"]].append(span)
+    for spans in by_gateway.values():
+        finished = 0
+        for span in spans:
+            if span["start_ts_ms"] < finished:
+                fail("overlapping_worker_phases")
+            finished = max(finished, span["end_ts_ms"])
+    attribution = []
+    for chain in calls.values():
+        enqueues = [e for e in chain if e["event"] == "broker_enqueue"]
+        starts = [e for e in chain if e["event"] == "broker_execute_start"]
+        if len(enqueues) != 1 or len(starts) != 1:
+            continue
+        enqueue, start = enqueues[0], starts[0]
+        if (
+            enqueue["gateway_slot"] != start["gateway_slot"]
+            or enqueue["ts_ms"] > start["ts_ms"]
+        ):
+            continue
+        low, high = enqueue["ts_ms"], start["ts_ms"]
+        overlaps, ranges = [], []
+        for span in by_gateway[start["run_id"], start["gateway_slot"]]:
+            if span["start_ts_ms"] >= high:
+                break
+            left, right = max(low, span["start_ts_ms"]), min(high, span["end_ts_ms"])
+            if right <= left:
+                continue
+            overlaps.append({**span, "overlap_ms": round(right - left, 6)})
+            ranges.append((left, right))
+        # Union, rather than sum, keeps corrupt overlapping observations from
+        # double-counting the wait. Individual overlaps remain visible.
+        observed = 0
+        covered_until = low
+        for left, right in sorted(ranges):
+            observed += max(0, right - max(left, covered_until))
+            covered_until = max(covered_until, right)
+        attribution.append(
+            {
+                "run_id": start["run_id"],
+                "gateway_slot": start["gateway_slot"],
+                "child_slot": start.get("child_slot"),
+                "call_id": start["call_id"],
+                "enqueue_seq": enqueue["seq"],
+                "execute_seq": start["seq"],
+                "enqueue_ts_ms": low,
+                "execute_ts_ms": high,
+                "wait_ms": start["wait_ms"],
+                "observed_phase_ms": round(observed, 6),
+                "unattributed_ms": round(max(0, high - low - observed), 6),
+                "overlaps": overlaps,
+            }
+        )
+    summary = {}
+    for phase in WORKER_PHASES:
+        done = [e for e in events if e["event"] == phase + "_done"]
+        summary[phase] = {
+            "count": sum(e["event"] == phase + "_start" for e in events),
+            "completed": len(done),
+            "errors": sum(e["outcome"] == "error" for e in done),
+            "max_duration_ms": max((e["duration_ms"] for e in done), default=None),
+        }
+    slow_selects = [e for e in events if e["event"] == "select_slow"]
+    summary["select_slow"] = {
+        "count": len(slow_selects),
+        "max_duration_ms": max((e["duration_ms"] for e in slow_selects), default=None),
+    }
+    summary["configuration_snapshots"] = [
+        {
+            k: v
+            for k, v in e.items()
+            if k in CONFIG_FIELDS | {"run_id", "gateway_slot", "seq", "ts_ms"}
+        }
+        for e in events
+        if e["event"] in {"gateway_start", "health"} and CONFIG_FIELDS & e.keys()
+    ]
+    summary["intervals"] = intervals
+    summary["queue_wait_attribution"] = attribution
+    return summary
 
 
 def analyze(lines, *, poll_window_seconds=1.0):
@@ -350,6 +523,10 @@ def analyze(lines, *, poll_window_seconds=1.0):
     if not events:
         warnings.add("no_valid_trace_events")
 
+    worker_phases = worker_observations(events, fail)
+    if any(worker_phases[phase]["errors"] for phase in WORKER_PHASES):
+        warnings.add("worker_phase_error")
+
     def values(name, field):
         return [e[field] for e in events if e["event"] == name and field in e]
 
@@ -370,6 +547,7 @@ def analyze(lines, *, poll_window_seconds=1.0):
         "warnings": sorted(warnings),
         "events": len(events),
         "schema_version": 1,
+        "worker_phases": worker_phases,
         "commands": {
             "logical_commands": requested,
             "completed": completed,

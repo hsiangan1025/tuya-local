@@ -31,14 +31,16 @@ EVENTS = frozenset(
     "tuya_send_result cmd_complete retry mark_sent stale_mark_sent_ignored "
     "pending_expire ack_timeout push_rx push_dispatch push_ack poll_due "
     "poll_start poll_done poll_error disconnect reconnect worker_failure "
-    "broker_drain_start broker_drain_done health".split()
+    "broker_drain_start broker_drain_done health connect_start connect_done "
+    "heartbeat_start heartbeat_done receive_start receive_done select_slow".split()
 )
 _NUMBERS = frozenset(
     "gateway_slot child_slot cmd_id poll_id call_id lock_id batch_id push_id "
     "pending_generation pending_cmd_id dp_count pending_count remaining_pending_count "
     "duration_ms wait_ms ack_latency_ms attempt calls_executed queue_depth_after "
     "broker_queue_depth broker_pending_futures registered_children gateway_members "
-    "socket_present worker_alive".split()
+    "socket_present worker_alive phase_id start_ts_ms socket_timeout_ms "
+    "socket_retry_limit socket_retry_delay_ms heartbeat_interval_ms select_timeout_ms".split()
 )
 _ENUMS = {
     "outcome": {"ok", "error", "cancelled", "stopped"},
@@ -83,6 +85,80 @@ def emit(event, fields=None, **values):
         # An optional diagnostic sink must never fail a command or its worker.
         # Do not report the exception through a potentially broken/raw logger.
         return
+
+
+@contextmanager
+def worker_phase(broker, phase):
+    """Observe one existing owner-thread call; never suppress its exception."""
+    if not enabled():
+        yield None
+        return
+    fields = {"gateway_slot": broker.trace_slot, "phase_id": new_id()}
+    observation = {"outcome": "error"}
+    started = monotonic()
+    emit(f"{phase}_start", fields)
+    try:
+        yield observation
+    finally:
+        emit(
+            f"{phase}_done",
+            fields,
+            duration_ms=(monotonic() - started) * 1000,
+            outcome=observation["outcome"],
+            socket_present=getattr(broker._parent, "socket", None) is not None,
+        )
+
+
+def io_outcome(result):
+    """A normal None return is not proof of a response or physical success."""
+    return "error" if isinstance(result, dict) and result.get("Err") else "ok"
+
+
+@contextmanager
+def select_wait(broker):
+    """No normal-timeout events, extra socket calls, sleeps or worker wakeups."""
+    if not enabled():
+        yield
+        return
+    started = monotonic()
+    try:
+        yield
+    finally:
+        duration = monotonic() - started
+        if duration > max(0.250, 2 * broker._select_timeout):
+            emit(
+                "select_slow",
+                gateway_slot=broker.trace_slot,
+                start_ts_ms=(started - _ORIGIN) * 1000,
+                duration_ms=duration * 1000,
+                socket_present=getattr(broker._parent, "socket", None) is not None,
+            )
+
+
+def socket_configuration(broker):
+    """Read configured numeric attributes only, never query a socket/API method."""
+    fields = {}
+    for name, obj, attribute, scale in (
+        ("socket_timeout_ms", broker._parent, "connection_timeout", 1000),
+        ("socket_retry_limit", broker._parent, "socketRetryLimit", 1),
+        ("socket_retry_delay_ms", broker._parent, "socketRetryDelay", 1000),
+        ("heartbeat_interval_ms", broker, "_heartbeat_interval", 1000),
+        ("select_timeout_ms", broker, "_select_timeout", 1000),
+    ):
+        try:
+            value = vars(obj).get(attribute)
+            if (
+                type(value) in (int, float)
+                and math.isfinite(value)
+                and value >= 0
+                and (name != "socket_retry_limit" or type(value) is int)
+                and math.isfinite(value * scale)
+            ):
+                fields[name] = value * scale
+        except TypeError, OverflowError:
+            # Missing/nonstandard attributes must not break an observation.
+            continue
+    return fields
 
 
 def device_fields(device):

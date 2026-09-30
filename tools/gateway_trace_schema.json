@@ -31,6 +31,8 @@
         "command_lock_acquired",
         "command_lock_released",
         "command_lock_wait",
+        "connect_done",
+        "connect_start",
         "debounce_done",
         "debounce_start",
         "disconnect",
@@ -40,6 +42,8 @@
         "gateway_start",
         "gateway_stop",
         "health",
+        "heartbeat_done",
+        "heartbeat_start",
         "lock_cancelled",
         "mark_sent",
         "pending_expire",
@@ -51,8 +55,11 @@
         "push_ack",
         "push_dispatch",
         "push_rx",
+        "receive_done",
+        "receive_start",
         "reconnect",
         "retry",
+        "select_slow",
         "stale_mark_sent_ignored",
         "tuya_send_result",
         "tuya_send_start",
@@ -195,6 +202,34 @@
     },
     "worker_alive": {
       "type": "boolean"
+    },
+    "phase_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "socket_retry_limit": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "start_ts_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "socket_timeout_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "socket_retry_delay_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "heartbeat_interval_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "select_timeout_ms": {
+      "type": "number",
+      "minimum": 0
     }
   },
   "allOf": [
@@ -601,6 +636,75 @@
           "gateway_members",
           "socket_present",
           "worker_alive"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "connect_start",
+              "heartbeat_start",
+              "receive_start",
+              "connect_done",
+              "heartbeat_done",
+              "receive_done"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot",
+          "phase_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "connect_done",
+              "heartbeat_done",
+              "receive_done"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "duration_ms",
+          "outcome",
+          "socket_present"
+        ],
+        "properties": {
+          "outcome": {
+            "enum": [
+              "ok",
+              "error"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "select_slow"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot",
+          "start_ts_ms",
+          "duration_ms",
+          "socket_present"
         ]
       }
     }

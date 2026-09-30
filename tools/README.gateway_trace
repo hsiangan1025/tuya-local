@@ -37,6 +37,36 @@ TinyTuya, it cannot schedule another snapshot until it returns. Snapshot fields
 are observations, not an atomic transaction across both threads. The analyzer
 reports the final OBSERVED queue/pending counts, or null if not observed.
 
+Worker blocking phases (additive schema v1 events):
+  connect_start / connect_done: only the existing _get_socket(False) attempt,
+    after the no-socket and reconnect-backoff checks have permitted it.
+  heartbeat_start / heartbeat_done: only an actually due heartbeat(nowait=True).
+  receive_start / receive_done: only parent.receive() after a readable select.
+Each pair has gateway_slot and a process-local phase_id. The done event adds
+duration_ms, outcome (ok/error), and socket_present, sampled before the existing
+error handling/disconnect. Exceptions and truthy Err results count as errors;
+connect requires True plus a present socket. A receive/heartbeat returning None
+is an ok RETURN, not proof of a response, timeout absence or device success.
+No result, payload or exception text is included. Phase timing is monotonic and
+includes the small tracing overhead; a blocked log sink can itself add latency.
+TinyTuya work inside queued status/control remains in broker_execute intervals;
+these new pairs do not separately label internal connects/retries inside them.
+
+select_slow is emitted only when the observed select exceeds BOTH 250 ms and
+twice the configured select timeout. It includes start_ts_ms, duration_ms and
+socket_present, including on select exceptions. Normal 100 ms timeouts are quiet.
+The threshold only gates diagnostics: no timeout, retry, backoff, heartbeat,
+poll cadence, lock, socket method call, sleep, await or worker wakeup is added
+or changed by these observations. Diagnostic sink exceptions remain contained.
+
+The first traced health includes available finite, nonnegative configuration
+attributes: socket_timeout_ms (parent.connection_timeout), socket_retry_limit
+(parent.socketRetryLimit), socket_retry_delay_ms (parent.socketRetryDelay),
+heartbeat_interval_ms and select_timeout_ms. Values are read from attributes,
+after the worker's existing setup; no TinyTuya or socket getter is called.
+Unknown, nonnumeric or invalid values are omitted. This is a configured-value
+snapshot, not an OS socket query, and is not repeated at every health event.
+
 Usage (standard library only; keep the JSON schema beside the analyzer):
   python tools/analyze_gateway_trace.py saved-ha.log
   python tools/analyze_gateway_trace.py - < saved-ha.log
@@ -51,6 +81,24 @@ Polling's short window is one second, separately per process and gateway.
 Commands.acknowledged counts commands whose observed remaining count reached
 zero; push.acknowledged counts individual matched updates. Commands.ack_timeouts
 counts logical commands with at least one expired update.
+
+worker_phases reports connect/heartbeat/receive count (starts), completed,
+errors and max_duration_ms; select_slow has count and max_duration_ms. With no
+observations, count is zero and maximum is null, not a claim no such work ran.
+configuration_snapshots preserves the safe runtime values and their seq/time.
+intervals contains paired phase spans, slow selects and broker executions with
+run/gateway, IDs, seq and monotonic endpoints. An open phase has a null end and
+is a strict unfinished_worker_phase FAIL; a malformed pair also fails. An error
+return is worker_phase_error WARN, separately from structural integrity failures.
+
+queue_wait_attribution lists each observed enqueue-to-execute interval, its
+overlapping completed worker spans and overlap_ms clipped to that wait. The
+union of those spans gives observed_phase_ms; the remainder is unattributed_ms.
+It never joins different gateways/runs, guesses a phase from a five-second wait,
+or fills in the end of an open phase. Normal selects, logging, scheduling gaps
+and other unobserved work can remain unattributed. Event-boundary spans include
+instrumentation overhead; duration_ms and event timestamp differences can differ
+slightly. These fields show temporal occupancy, not the packet-level root cause.
 
 The analyzer detects missing command stages, unreleased locks, unresolved
 broker operations, missing send results, sends without intervening retries,

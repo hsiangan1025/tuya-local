@@ -76,6 +76,7 @@ class GatewayBroker:
         self._trace_children = {}
         self.trace_gateway_members = 0
         self._trace_last_health = None
+        self._trace_config_observed = False
 
     def trace_child_slot(self, child_api):
         with self._children_lock:
@@ -84,6 +85,10 @@ class GatewayBroker:
     def _trace_health(self):
         """Called on HA's loop so future/member counts have the same owner."""
         if trace.enabled():
+            configuration = {}
+            if not self._trace_config_observed:
+                configuration = trace.socket_configuration(self)
+                self._trace_config_observed = True
             trace.emit(
                 "health",
                 gateway_slot=self.trace_slot,
@@ -93,6 +98,7 @@ class GatewayBroker:
                 gateway_members=self.trace_gateway_members,
                 socket_present=getattr(self._parent, "socket", None) is not None,
                 worker_alive=self.running,
+                **configuration,
             )
 
     def _trace_activity(self):
@@ -227,12 +233,13 @@ class GatewayBroker:
                     continue
 
                 try:
-                    readable, _, _ = select.select(
-                        [sock],
-                        [],
-                        [],
-                        self._select_timeout,
-                    )
+                    with trace.select_wait(self):
+                        readable, _, _ = select.select(
+                            [sock],
+                            [],
+                            [],
+                            self._select_timeout,
+                        )
                 except OSError, ValueError:
                     self._disconnect("select failed")
                     continue
@@ -241,7 +248,10 @@ class GatewayBroker:
                     continue
 
                 try:
-                    data = self._parent.receive()
+                    with trace.worker_phase(self, "receive") as observation:
+                        data = self._parent.receive()
+                        if observation is not None:
+                            observation["outcome"] = trace.io_outcome(data)
                 except Exception as exc:
                     _LOGGER.debug(
                         "Gateway receive failed: %s",
@@ -349,7 +359,15 @@ class GatewayBroker:
 
         self._parent.set_socketPersistent(True)
         try:
-            result = self._parent._get_socket(False)
+            with trace.worker_phase(self, "connect") as observation:
+                result = self._parent._get_socket(False)
+                if observation is not None:
+                    observation["outcome"] = (
+                        "ok"
+                        if result is True
+                        and getattr(self._parent, "socket", None) is not None
+                        else "error"
+                    )
         except Exception:
             _LOGGER.debug("Gateway connection attempt failed", exc_info=True)
             result = None
@@ -374,7 +392,10 @@ class GatewayBroker:
             return
 
         try:
-            result = self._parent.heartbeat(nowait=True)
+            with trace.worker_phase(self, "heartbeat") as observation:
+                result = self._parent.heartbeat(nowait=True)
+                if observation is not None:
+                    observation["outcome"] = trace.io_outcome(result)
         except Exception:
             _LOGGER.debug("Gateway heartbeat failed", exc_info=True)
             self._disconnect("heartbeat failed")

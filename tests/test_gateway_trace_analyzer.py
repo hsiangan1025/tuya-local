@@ -372,3 +372,285 @@ def test_strict_analysis_retains_tail_open_lifecycle_failures(last_event, failur
     result = analyze(lines(events[: boundary + 1]))
     assert result["status"] == "FAIL"
     assert failure in result["failures"]
+
+
+def worker_wait_events(phase, *, outcome="ok"):
+    """Five seconds outside drain, followed by a ten-millisecond status call."""
+    return [
+        dict(event="gateway_start", gateway_slot=1, ts_ms=0),
+        dict(
+            event="broker_enqueue",
+            gateway_slot=1,
+            child_slot=2,
+            call_id=7,
+            operation="request",
+            ts_ms=100,
+            broker_queue_depth=1,
+            broker_pending_futures=1,
+        ),
+        dict(event=phase + "_start", gateway_slot=1, phase_id=9, ts_ms=100),
+        dict(
+            event=phase + "_done",
+            gateway_slot=1,
+            phase_id=9,
+            ts_ms=5100,
+            duration_ms=5000,
+            outcome=outcome,
+            socket_present=True,
+        ),
+        dict(
+            event="broker_execute_start",
+            gateway_slot=1,
+            child_slot=2,
+            call_id=7,
+            operation="request",
+            ts_ms=5100,
+            wait_ms=5000,
+        ),
+        dict(
+            event="broker_execute_done",
+            gateway_slot=1,
+            child_slot=2,
+            call_id=7,
+            operation="request",
+            ts_ms=5110,
+            duration_ms=10,
+            outcome="ok",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("phase", ["connect", "heartbeat", "receive"])
+@pytest.mark.parametrize("outcome", ["ok", "error"])
+def test_five_second_queue_wait_is_attributed_to_observed_worker_phase(phase, outcome):
+    sample = lines(worker_wait_events(phase, outcome=outcome))
+    result = analyze(sample)
+    assert result == analyze(list(reversed(sample)))
+    assert result["status"] == ("PASS" if outcome == "ok" else "WARN")
+    worker = result["worker_phases"]
+    assert worker[phase] == {
+        "count": 1,
+        "completed": 1,
+        "errors": int(outcome == "error"),
+        "max_duration_ms": 5000,
+    }
+    wait = worker["queue_wait_attribution"][0]
+    assert wait["call_id"] == 7 and wait["child_slot"] == 2
+    assert (wait["enqueue_seq"], wait["execute_seq"]) == (2, 5)
+    assert wait["observed_phase_ms"] == 5000
+    assert wait["unattributed_ms"] == 0
+    assert len(wait["overlaps"]) == 1
+    span = wait["overlaps"][0]
+    assert span["phase"] == phase and span["phase_id"] == 9
+    assert span["start_seq"] == 3 and span["end_seq"] == 4
+    assert span["overlap_ms"] == 5000
+    execution = next(s for s in worker["intervals"] if s["phase"] == "broker_execute")
+    assert execution["duration_ms"] == 10
+
+
+def test_queue_attribution_clips_phase_to_wait_and_retains_unobserved_time():
+    events = worker_wait_events("receive")
+    events[2]["ts_ms"] = 0  # Receive was already active at enqueue.
+    events[3].update(ts_ms=4100, duration_ms=4100)
+    # Keep sequence order consistent with the receive starting earlier.
+    events[1], events[2] = events[2], events[1]
+    result = analyze(lines(events))
+    wait = result["worker_phases"]["queue_wait_attribution"][0]
+    assert wait["observed_phase_ms"] == 4000
+    assert wait["unattributed_ms"] == 1000
+    assert wait["overlaps"][0]["overlap_ms"] == 4000
+
+
+def test_slow_select_can_be_attributed_without_logging_normal_selects():
+    events = worker_wait_events("receive")
+    events[2:4] = [
+        dict(
+            event="select_slow",
+            gateway_slot=1,
+            ts_ms=5100,
+            start_ts_ms=100,
+            duration_ms=5000,
+            socket_present=True,
+        )
+    ]
+    result = analyze(lines(events))
+    worker = result["worker_phases"]
+    assert worker["select_slow"] == {"count": 1, "max_duration_ms": 5000}
+    wait = worker["queue_wait_attribution"][0]
+    assert wait["overlaps"][0]["phase"] == "select"
+    assert wait["observed_phase_ms"] == 5000
+
+
+def test_multiple_phases_explain_parts_of_one_wait():
+    events = worker_wait_events("connect")
+    events[3].update(ts_ms=2100, duration_ms=2000)
+    events[4:4] = [
+        dict(event="receive_start", gateway_slot=1, phase_id=10, ts_ms=2100),
+        dict(
+            event="receive_done",
+            gateway_slot=1,
+            phase_id=10,
+            ts_ms=5100,
+            duration_ms=3000,
+            socket_present=True,
+            outcome="ok",
+        ),
+    ]
+    wait = analyze(lines(events))["worker_phases"]["queue_wait_attribution"][0]
+    assert [(s["phase"], s["overlap_ms"]) for s in wait["overlaps"]] == [
+        ("connect", 2000),
+        ("receive", 3000),
+    ]
+    assert wait["observed_phase_ms"] == 5000 and wait["unattributed_ms"] == 0
+
+
+@pytest.mark.parametrize("scope", ["gateway_slot", "run_id"])
+def test_attribution_never_joins_different_gateways_or_runs(scope):
+    events = worker_wait_events("receive")
+    events[2][scope] = events[3][scope] = 99
+    result = analyze(lines(events))
+    wait = result["worker_phases"]["queue_wait_attribution"][0]
+    assert wait["overlaps"] == []
+    assert wait["observed_phase_ms"] == 0 and wait["unattributed_ms"] == 5000
+
+
+def test_old_capture_does_not_gain_a_guessed_five_second_attribution():
+    events = worker_wait_events("receive")
+    del events[2:4]
+    result = analyze(lines(events))
+    assert result["status"] == "PASS"
+    worker = result["worker_phases"]
+    assert worker["receive"]["count"] == 0
+    assert worker["receive"]["max_duration_ms"] is None
+    wait = worker["queue_wait_attribution"][0]
+    assert wait["overlaps"] == [] and wait["unattributed_ms"] == 5000
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_start",
+        "missing_done",
+        "mismatched_phase",
+        "wrong_gateway",
+        "reverse_time",
+        "duplicate_start",
+    ],
+)
+def test_incomplete_or_malformed_worker_phases_fail(change):
+    events = worker_wait_events("receive")
+    if change == "missing_start":
+        del events[2]
+    elif change == "missing_done":
+        del events[3]
+    elif change == "mismatched_phase":
+        events[3]["event"] = "heartbeat_done"
+    elif change == "wrong_gateway":
+        events[3]["gateway_slot"] = 2
+    elif change == "reverse_time":
+        events[3]["ts_ms"] = 0
+    else:
+        events.insert(3, dict(events[2]))
+    result = analyze(lines(events))
+    assert result["status"] == "FAIL"
+    assert set(result["failures"]) & {
+        "unfinished_worker_phase",
+        "malformed_worker_phase",
+    }
+
+
+def test_tail_open_worker_phase_is_not_silently_excused():
+    events = worker_wait_events("connect")[:3]
+    result = analyze(lines(events))
+    assert "unfinished_worker_phase" in result["failures"]
+    span = result["worker_phases"]["intervals"][0]
+    assert span["phase_id"] == 9 and span["end_seq"] is None
+    assert span["duration_ms"] is None
+
+
+@pytest.mark.parametrize("bad", [True, -1, float("inf"), "PRIVATE_CONFIG_SENTINEL"])
+def test_worker_configuration_validation_is_numeric_only(bad):
+    event = dict(event="gateway_start", gateway_slot=1, socket_timeout_ms=bad)
+    assert parse(lines([event])) == []
+
+
+def test_worker_phase_outcome_validation_and_privacy():
+    events = worker_wait_events("receive")
+    for event in events:
+        event["payload"] = "PRIVATE_PAYLOAD_SENTINEL"
+        event["exception"] = "PRIVATE_EXCEPTION_SENTINEL"
+    result = analyze(lines(events))
+    assert result["status"] == "PASS"
+    assert "PRIVATE_" not in json.dumps(result)
+    events[3]["outcome"] = "cancelled"  # Valid for commands, not these phases.
+    assert not any(e["event"] == "receive_done" for e in parse(lines(events)))
+
+
+def test_another_broker_execution_can_occupy_the_wait():
+    events = worker_wait_events("connect")
+    del events[2:4]
+    events[1:1] = [
+        dict(
+            event="broker_enqueue",
+            gateway_slot=1,
+            call_id=8,
+            operation="request",
+            ts_ms=0,
+            broker_queue_depth=1,
+            broker_pending_futures=1,
+        ),
+        dict(
+            event="broker_execute_start",
+            gateway_slot=1,
+            call_id=8,
+            operation="request",
+            ts_ms=0,
+            wait_ms=0,
+        ),
+    ]
+    events.insert(
+        4,
+        dict(
+            event="broker_execute_done",
+            gateway_slot=1,
+            call_id=8,
+            operation="request",
+            ts_ms=5100,
+            duration_ms=5100,
+            outcome="ok",
+        ),
+    )
+    result = analyze(lines(events))
+    assert result["status"] == "PASS"
+    wait = next(
+        w
+        for w in result["worker_phases"]["queue_wait_attribution"]
+        if w["call_id"] == 7
+    )
+    assert wait["observed_phase_ms"] == 5000 and wait["unattributed_ms"] == 0
+    assert wait["overlaps"][0]["phase"] == "broker_execute"
+    assert wait["overlaps"][0]["call_id"] == 8
+
+
+def test_overlapping_worker_spans_fail_without_double_counting_wait():
+    events = worker_wait_events("connect")
+    events.insert(
+        3, dict(event="receive_start", gateway_slot=1, phase_id=10, ts_ms=100)
+    )
+    events.insert(
+        5,
+        dict(
+            event="receive_done",
+            gateway_slot=1,
+            phase_id=10,
+            ts_ms=5100,
+            duration_ms=5000,
+            outcome="ok",
+            socket_present=True,
+        ),
+    )
+    result = analyze(lines(events))
+    assert "overlapping_worker_phases" in result["failures"]
+    wait = result["worker_phases"]["queue_wait_attribution"][0]
+    assert len(wait["overlaps"]) == 2
+    assert wait["observed_phase_ms"] == 5000 and wait["unattributed_ms"] == 0
