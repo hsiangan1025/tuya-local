@@ -16,6 +16,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 
+from . import trace
 from .const import (
     API_PROTOCOL_VERSIONS,
     CONF_DEVICE_CID,
@@ -334,6 +335,8 @@ class TuyaLocalDevice(object):
         if isinstance(poll, dict):
             self._api_protocol_working = True
             self._api_working_protocol_failures = 0
+            if trace.enabled():
+                trace.push_ack(self, poll)
             self._process_received(dict(poll))
 
     def register_entity(self, entity):
@@ -598,11 +601,13 @@ class TuyaLocalDevice(object):
         while self._running:
             self._gateway_poll_event.clear()
             poll_failed = False
+            observation = None
             try:
                 if (
                     not self._temporary_poll
                     and time() - self._last_full_poll >= self._CACHE_TIMEOUT
                 ):
+                    observation = trace.poll_start(self)
                     if self._force_dps and self._api_protocol_working:
                         update = await self._retry_on_failed_connection(
                             lambda: self._api.updatedps(self._force_dps),
@@ -626,6 +631,9 @@ class TuyaLocalDevice(object):
                         if not self.has_returned_state:
                             for entity in self._children:
                                 entity.async_schedule_update_ha_state()
+            except CancelledError:
+                poll_failed = True
+                raise
             except Exception:
                 if self._closed:
                     return
@@ -634,6 +642,8 @@ class TuyaLocalDevice(object):
                 poll_failed = True
                 for entity in self._children:
                     entity.async_schedule_update_ha_state()
+            finally:
+                trace.poll_done(observation, poll_failed)
             # Pushes update the cache independently. Only the full-poll deadline
             # or a pause/resume transition needs to wake this coroutine.
             delay = None
@@ -745,6 +755,7 @@ class TuyaLocalDevice(object):
     def _reset_cached_state(self):
         self._cached_state = {"updated_at": 0}
         self._pending_updates = {}
+        self._trace_pending = {}
         self._last_connection = 0
         self._last_full_poll = 0
 
@@ -793,9 +804,10 @@ class TuyaLocalDevice(object):
             # Keep each child's pending state, debounce and retry lifecycle
             # together. A later command must not snapshot an earlier command's
             # unsent values or be acknowledged/cleared by its completion.
-            async with self._command_lock:
-                self._add_properties_to_pending_updates(properties)
-                await self._debounce_sending_updates()
+            with trace.command(self, len(properties)):
+                async with trace.measured_lock(self._command_lock, "command"):
+                    self._add_properties_to_pending_updates(properties)
+                    await self._debounce_sending_updates()
             return
 
         self._add_properties_to_pending_updates(properties)
@@ -812,6 +824,9 @@ class TuyaLocalDevice(object):
                 "sent": False,
             }
 
+        if self.dev_cid:
+            trace.pending_added(self, properties)
+
         _LOGGER.debug(
             "%s new pending updates: %s",
             self.name,
@@ -824,6 +839,8 @@ class TuyaLocalDevice(object):
             for key, value in self._pending_updates.items()
             if key not in data or not value["sent"] or data[key] != value["value"]
         }
+        if self.dev_cid and self._trace_pending:
+            trace.prune_pending(self)
 
     async def _debounce_sending_updates(self):
         now = time()
@@ -836,7 +853,8 @@ class TuyaLocalDevice(object):
         # same send mechanism.
         waittime = 1 if since < 1.1 and self.should_poll else 0.001
 
-        await asyncio.sleep(waittime)
+        with trace.debounce():
+            await asyncio.sleep(waittime)
         await self._send_pending_updates()
 
     async def _send_pending_updates(self):
@@ -853,13 +871,35 @@ class TuyaLocalDevice(object):
             submitted_updates = {
                 key: self._pending_updates[key] for key in pending_properties
             }
+            trace_snapshot = trace.pending_snapshot(self, pending_properties)
 
             def send():
-                result = self._api.set_multiple_values(pending_properties, nowait=True)
-                if not isinstance(result, dict) or "Err" not in result:
-                    self._hass.loop.call_soon_threadsafe(
-                        self._mark_updates_sent, pending_properties, submitted_updates
+                with trace.send() as observation:
+                    result = self._api.set_multiple_values(
+                        pending_properties, nowait=True
                     )
+                    sent_at = trace.monotonic() if trace_snapshot is not None else None
+                    if observation is not None:
+                        observation["outcome"] = (
+                            "error"
+                            if isinstance(result, dict) and "Err" in result
+                            else "ok"
+                        )
+                if not isinstance(result, dict) or "Err" not in result:
+                    if trace_snapshot is not None:
+                        self._hass.loop.call_soon_threadsafe(
+                            self._mark_updates_sent,
+                            pending_properties,
+                            submitted_updates,
+                            trace_snapshot,
+                            sent_at,
+                        )
+                    else:
+                        self._hass.loop.call_soon_threadsafe(
+                            self._mark_updates_sent,
+                            pending_properties,
+                            submitted_updates,
+                        )
                 return result
 
             await self._retry_on_failed_connection(
@@ -876,10 +916,13 @@ class TuyaLocalDevice(object):
         self._api.set_multiple_values(properties, nowait=True)
         self._mark_updates_sent(properties)
 
-    def _mark_updates_sent(self, properties, submitted_updates=None):
+    def _mark_updates_sent(
+        self, properties, submitted_updates=None, trace_snapshot=None, sent_at=None
+    ):
         now = time()
         self._last_connection = now
         pending_updates = self._get_pending_updates()
+        trace_accepted = set() if trace_snapshot is not None else None
         for key in properties.keys():
             if (
                 key in pending_updates
@@ -893,6 +936,9 @@ class TuyaLocalDevice(object):
             ):
                 pending_updates[key]["updated_at"] = now
                 pending_updates[key]["sent"] = True
+                if trace_accepted is not None:
+                    trace_accepted.add(key)
+        trace.marked(self, trace_accepted, trace_snapshot, sent_at)
 
     async def _retry_on_failed_connection(self, func, error_message):
         if self.dev_cid:
@@ -903,7 +949,7 @@ class TuyaLocalDevice(object):
         await self._async_ensure_gateway()
         gateway = self._gateway
         try:
-            async with gateway.lock:
+            async with trace.measured_lock(gateway.lock, "gateway", self):
                 if self._closed:
                     raise RuntimeError("Gateway child is stopped")
                 if not self._broker.running:
@@ -1006,7 +1052,13 @@ class TuyaLocalDevice(object):
             try:
                 if not self._hass.is_stopping:
                     if self.dev_cid:
-                        retval = await self._broker.async_call(func)
+                        ctx = trace.current()
+                        retval = await self._broker.async_call(
+                            func,
+                            trace_kind="control"
+                            if ctx and "cmd_id" in ctx.fields
+                            else "request",
+                        )
                     else:
                         async with self._api_lock:
                             retval = await self._hass.async_add_executor_job(func)
@@ -1030,6 +1082,12 @@ class TuyaLocalDevice(object):
                         on_success(retval)
                     return retval
             except Exception as e:
+                ctx = trace.current() if self.dev_cid else None
+                if ctx:
+                    if i + 1 < connections:
+                        ctx.event("retry", attempt=i + 2)
+                    else:
+                        ctx.outcome = "error"
                 _LOGGER.debug(
                     "Retrying after exception %s %s (%d/%d)",
                     type(e).__name__,
@@ -1107,6 +1165,8 @@ class TuyaLocalDevice(object):
             if not value["sent"]
             or now - value.get("updated_at", 0) < self._FAKE_IT_TIMEOUT
         }
+        if self.dev_cid and self._trace_pending:
+            trace.prune_pending(self, expired=True)
         return self._pending_updates
 
     async def _rotate_api_protocol_version(self):

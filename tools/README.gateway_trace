@@ -1,0 +1,71 @@
+GBTRACE canary diagnostics (schema v1)
+
+Enable only custom_components.tuya_local.trace at DEBUG for a future canary.
+The existing integration and TinyTuya debug loggers are outside this schema.
+No deployment, restart, reload or logger configuration is performed by these tools.
+
+Every message is GBTRACE followed by one JSON object. The exact envelope and
+event-specific required fields are in gateway_trace_schema.json. Durations and
+ts_ms use monotonic milliseconds. seq orders records within a process. run_id
+is a random process token; all other IDs/slots are increasing counters. None
+is allowed for gateway_slot/child_slot before acquisition or after unregister.
+No identifier, name, address, DP ID/value, payload, key or exception text is
+allowed in the trace. The emitter filters fields and catches sink failures.
+
+Logical commands keep cmd_id through retries and across the worker boundary.
+Request retries without cmd_id belong to polling/setup and are not counted as
+logical outbound command retries by the analyzer.
+call_id identifies an individual broker operation, lock_id one acquisition,
+poll_id one safety poll, batch_id one nonempty drain, and push_id one received
+message. pending_generation identifies one pending insertion batch; multiple
+DPs in that batch share a generation. Replacements always get a fresh one.
+pending_cmd_id records the original pending owner if an older cancelled
+request's unsent state is included in a later command's snapshot.
+
+mark_sent observes the unchanged production acceptance predicate. A rejected
+old snapshot emits stale_mark_sent_ignored under its original cmd_id/generation.
+push_ack is emitted only for matching gateway pushes, not status-poll data.
+remaining_pending_count counts the still-observed pending properties belonging
+to that logical command, not every child or every command on the gateway.
+ack_latency_ms starts when the successful TinyTuya call returned. FAKE_IT_TIMEOUT
+is unchanged: pending_expire/ack_timeout occur when normal pending-state access
+actually removes expired sent state, not on a new background timer.
+
+Health snapshots piggyback on broker activity at most once per 60 seconds,
+plus a final snapshot after joining the worker. If the worker is blocked inside
+TinyTuya, it cannot schedule another snapshot until it returns. Snapshot fields
+are observations, not an atomic transaction across both threads. The analyzer
+reports the final OBSERVED queue/pending counts, or null if not observed.
+
+Usage (standard library only; keep the JSON schema beside the analyzer):
+  python tools/analyze_gateway_trace.py saved-ha.log
+  python tools/analyze_gateway_trace.py - < saved-ha.log
+
+Output is deterministic JSON. Exit codes are PASS=0, WARN=1, FAIL=2. Only
+GBTRACE JSON is parsed; malformed/foreign lines and fields are not echoed.
+Latency distributions are milliseconds with linearly interpolated percentiles.
+Polling's short window is one second, separately per process and gateway.
+Commands.acknowledged counts commands whose observed remaining count reached
+zero; push.acknowledged counts individual matched updates. Commands.ack_timeouts
+counts logical commands with at least one expired update.
+
+The analyzer detects missing command stages, unreleased locks, unresolved
+broker operations, missing send results, sends without intervening retries,
+unfinished batches/polls, bad lifecycle ordering, worker failure, and a rising
+nondecreasing backlog in the last three health observations. Missing ACK alone,
+ACK timeout, error completion or cancellation are WARN, never proof of failure.
+Live gateways need not stop before a capture ends; started commands, calls,
+lock acquisitions, polls and drain batches must finish for a clean result.
+
+Limits: capture from before the relevant lifecycles through their completion.
+Truncation, runtime logging changes or dropped log records can resemble missing
+events. A sink failure is deliberately swallowed to preserve device behavior.
+Logging consumes CPU and the configured log sink may add I/O latency. The
+analyzer cannot certify a physical action, correlate a matching unsolicited
+state change with causality, see TinyTuya-internal packet retransmissions, or
+promise hardware latency. A 'send' is a TinyTuya control invocation; reconnect
+events observe the broker's connection path, not every internal TinyTuya action.
+
+The virtual tests model opaque blocking status calls, unlike TinyTuya's richer
+wrong-CID buffering. Their starvation bound is one select wait plus all remaining
+serialized status work in the finite burst, not a hardware latency SLA.

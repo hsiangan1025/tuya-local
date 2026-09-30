@@ -28,6 +28,8 @@ from typing import Any, Callable
 
 from homeassistant.core import HomeAssistant
 
+from . import trace
+
 _LOGGER = logging.getLogger(__name__)
 
 MessageCallback = Callable[[dict[str, Any]], None]
@@ -39,6 +41,7 @@ class _BrokerCall:
 
     func: Callable[[], Any]
     future: asyncio.Future[Any]
+    observation: trace.BrokerCall | None = None
 
 
 class GatewayBroker:
@@ -69,6 +72,36 @@ class GatewayBroker:
         self._stop_task: asyncio.Task | None = None
         self._next_connect_attempt = 0.0
         self._last_heartbeat = 0.0
+        self.trace_slot = trace.new_id()
+        self._trace_children = {}
+        self.trace_gateway_members = 0
+        self._trace_last_health = None
+
+    def trace_child_slot(self, child_api):
+        with self._children_lock:
+            return self._trace_children.get(id(child_api))
+
+    def _trace_health(self):
+        """Called on HA's loop so future/member counts have the same owner."""
+        if trace.enabled():
+            trace.emit(
+                "health",
+                gateway_slot=self.trace_slot,
+                broker_queue_depth=self._calls.qsize(),
+                broker_pending_futures=len(self._pending),
+                registered_children=self.child_count,
+                gateway_members=self.trace_gateway_members,
+                socket_present=getattr(self._parent, "socket", None) is not None,
+                worker_alive=self.running,
+            )
+
+    def _trace_activity(self):
+        if not trace.enabled():
+            return
+        now = trace.monotonic()
+        if self._trace_last_health is None or now - self._trace_last_health >= 60:
+            self._trace_last_health = now
+            self._hass.loop.call_soon_threadsafe(self._trace_health)
 
     @property
     def parent_api(self) -> Any:
@@ -90,11 +123,19 @@ class GatewayBroker:
         """Register a child API object for CID-routed push delivery."""
         with self._children_lock:
             self._children[id(child_api)] = callback
+            slot = self._trace_children.setdefault(id(child_api), trace.new_id())
+        if trace.enabled():
+            trace.emit("child_register", gateway_slot=self.trace_slot, child_slot=slot)
 
     def unregister_child(self, child_api: Any) -> None:
         """Remove a child from push delivery."""
         with self._children_lock:
             self._children.pop(id(child_api), None)
+            slot = self._trace_children.pop(id(child_api), None)
+        if slot is not None and trace.enabled():
+            trace.emit(
+                "child_unregister", gateway_slot=self.trace_slot, child_slot=slot
+            )
 
     async def async_start(self) -> None:
         """Start the single gateway I/O owner."""
@@ -142,8 +183,11 @@ class GatewayBroker:
 
         await self._hass.async_add_executor_job(thread.join)
         self._thread = None
+        self._trace_health()
+        if trace.enabled():
+            trace.emit("gateway_stop", gateway_slot=self.trace_slot)
 
-    async def async_call(self, func: Callable[[], Any]) -> Any:
+    async def async_call(self, func: Callable[[], Any], *, trace_kind="call") -> Any:
         """Run one TinyTuya operation on the gateway I/O owner thread."""
         if not self.running or self._stop_event.is_set():
             raise RuntimeError("Gateway broker is not running")
@@ -151,16 +195,20 @@ class GatewayBroker:
         future = self._hass.loop.create_future()
         self._pending.add(future)
         future.add_done_callback(self._pending.discard)
-        self._calls.put(_BrokerCall(func=func, future=future))
+        observation = trace.enqueue(self, trace_kind)
+        self._calls.put(_BrokerCall(func=func, future=future, observation=observation))
         return await future
 
     def _worker(self) -> None:
         """Own all gateway socket reads and writes."""
+        if trace.enabled():
+            trace.emit("gateway_start", gateway_slot=self.trace_slot)
         try:
             self._parent.set_socketRetryLimit(1)
             self._parent.set_socketPersistent(True)
             while not self._stop_event.is_set():
                 self._drain_calls()
+                self._trace_activity()
                 if self._stop_event.is_set():
                     break
 
@@ -205,6 +253,8 @@ class GatewayBroker:
 
                 self._dispatch(data)
         except Exception:
+            if trace.enabled():
+                trace.emit("worker_failure", gateway_slot=self.trace_slot)
             _LOGGER.exception("Gateway broker worker failed")
         finally:
             self._stop_event.set()
@@ -226,36 +276,67 @@ class GatewayBroker:
 
     def _drain_calls(self) -> None:
         """Execute pending status/control operations serially."""
-        while not self._stop_event.is_set():
-            try:
-                call = self._calls.get_nowait()
-            except queue.Empty:
-                return
+        batch = None
+        executed = 0
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    call = self._calls.get_nowait()
+                except queue.Empty:
+                    return
 
-            if call.future.cancelled():
-                continue
+                if call.future.cancelled():
+                    if call.observation is not None:
+                        trace.emit(
+                            "broker_cancelled",
+                            call.observation.fields,
+                            outcome="cancelled",
+                        )
+                    continue
 
-            try:
-                self._parent.set_socketPersistent(True)
-                result = call.func()
-            except Exception as exc:
-                self._hass.loop.call_soon_threadsafe(
-                    self._set_future_exception,
-                    call.future,
-                    exc,
+                if batch is None and trace.enabled():
+                    batch = (trace.new_id(), trace.monotonic())
+                    trace.emit(
+                        "broker_drain_start",
+                        gateway_slot=self.trace_slot,
+                        batch_id=batch[0],
+                    )
+                executed += 1
+                try:
+                    with trace.execute(call.observation):
+                        self._parent.set_socketPersistent(True)
+                        result = call.func()
+                except Exception as exc:
+                    self._hass.loop.call_soon_threadsafe(
+                        self._set_future_exception,
+                        call.future,
+                        exc,
+                    )
+                    # TinyTuya may have closed the parent socket after an error.
+                    if getattr(self._parent, "socket", None) is None:
+                        self._next_connect_attempt = 0.0
+                else:
+                    self._hass.loop.call_soon_threadsafe(
+                        self._set_future_result,
+                        call.future,
+                        result,
+                    )
+
+                # A child call can cache async messages for another CID.
+                self._drain_cached_messages()
+                # A continuously replenished batch is activity too. Health
+                # must not depend on eventually observing an empty queue.
+                self._trace_activity()
+        finally:
+            if batch is not None and trace.enabled():
+                trace.emit(
+                    "broker_drain_done",
+                    gateway_slot=self.trace_slot,
+                    batch_id=batch[0],
+                    calls_executed=executed,
+                    duration_ms=(trace.monotonic() - batch[1]) * 1000,
+                    queue_depth_after=self._calls.qsize(),
                 )
-                # TinyTuya may have closed the parent socket after an error.
-                if getattr(self._parent, "socket", None) is None:
-                    self._next_connect_attempt = 0.0
-            else:
-                self._hass.loop.call_soon_threadsafe(
-                    self._set_future_result,
-                    call.future,
-                    result,
-                )
-
-            # A child call can cache async messages for another CID.
-            self._drain_cached_messages()
 
     def _ensure_connected(self) -> None:
         """Open the parent persistent socket when needed."""
@@ -277,6 +358,8 @@ class GatewayBroker:
             self._last_heartbeat = time.monotonic()
             self._next_connect_attempt = 0.0
             _LOGGER.debug("Gateway broker connected")
+            if trace.enabled():
+                trace.emit("reconnect", gateway_slot=self.trace_slot)
             return
 
         self._next_connect_attempt = now + self._reconnect_backoff
@@ -329,11 +412,11 @@ class GatewayBroker:
                 continue
 
             dispatched = True
-            self._dispatch(data)
+            self._dispatch(data, trace_source="cache")
 
         return dispatched
 
-    def _dispatch(self, data: Any) -> None:
+    def _dispatch(self, data: Any, *, trace_source="socket") -> None:
         """Dispatch one CID-routed TinyTuya result to its child."""
         if not isinstance(data, dict):
             return
@@ -350,6 +433,17 @@ class GatewayBroker:
 
         with self._children_lock:
             callback = self._children.get(id(child_api))
+            slot = self._trace_children.get(id(child_api))
+
+        observation = None
+        if trace.enabled():
+            observation = {
+                "gateway_slot": self.trace_slot,
+                "child_slot": slot,
+                "push_id": trace.new_id(),
+                "source": trace_source,
+            }
+            trace.emit("push_rx", observation)
 
         if callback is None:
             _LOGGER.debug(
@@ -358,18 +452,24 @@ class GatewayBroker:
             )
             return
 
-        self._hass.loop.call_soon_threadsafe(self._deliver, child_api, callback, data)
+        self._hass.loop.call_soon_threadsafe(
+            self._deliver, child_api, callback, data, observation
+        )
 
-    def _deliver(self, child_api, callback, data) -> None:
+    def _deliver(self, child_api, callback, data, observation=None) -> None:
         """Discard deliveries queued before a child was unregistered."""
         with self._children_lock:
             current = self._children.get(id(child_api))
         if current is callback and not self._stop_event.is_set():
+            if observation is not None:
+                trace.emit("push_dispatch", observation)
             callback(data)
 
     def _disconnect(self, reason: str) -> None:
         """Close a bad socket so the worker reconnects on the next cycle."""
         _LOGGER.debug("Gateway broker disconnecting: %s", reason)
+        if trace.enabled():
+            trace.emit("disconnect", gateway_slot=self.trace_slot)
         try:
             self._parent.set_socketPersistent(False)
         except Exception:
@@ -389,6 +489,10 @@ class GatewayBroker:
             except queue.Empty:
                 return
 
+            if call.observation is not None:
+                trace.emit(
+                    "broker_cancelled", call.observation.fields, outcome="stopped"
+                )
             self._hass.loop.call_soon_threadsafe(
                 self._set_future_exception,
                 call.future,

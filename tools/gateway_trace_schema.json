@@ -1,0 +1,608 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Tuya Local GBTRACE v1",
+  "description": "One JSON object after GBTRACE. Ephemeral process-local counters only; durations and timestamps are monotonic milliseconds. run_id is a random process token. Nullable slots mean acquisition has not finished or a child is no longer registered.",
+  "type": "object",
+  "required": [
+    "v",
+    "run_id",
+    "seq",
+    "ts_ms",
+    "event"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "event": {
+      "enum": [
+        "ack_timeout",
+        "broker_cancelled",
+        "broker_drain_done",
+        "broker_drain_start",
+        "broker_enqueue",
+        "broker_execute_done",
+        "broker_execute_start",
+        "child_register",
+        "child_unregister",
+        "cmd_complete",
+        "cmd_request",
+        "command_lock_acquired",
+        "command_lock_released",
+        "command_lock_wait",
+        "debounce_done",
+        "debounce_start",
+        "disconnect",
+        "gateway_lock_acquired",
+        "gateway_lock_released",
+        "gateway_lock_wait",
+        "gateway_start",
+        "gateway_stop",
+        "health",
+        "lock_cancelled",
+        "mark_sent",
+        "pending_expire",
+        "pending_snapshot",
+        "poll_done",
+        "poll_due",
+        "poll_error",
+        "poll_start",
+        "push_ack",
+        "push_dispatch",
+        "push_rx",
+        "reconnect",
+        "retry",
+        "stale_mark_sent_ignored",
+        "tuya_send_result",
+        "tuya_send_start",
+        "worker_failure"
+      ]
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "batch_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "broker_pending_futures": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "broker_queue_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "call_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "calls_executed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "child_slot": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "cmd_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dp_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "gateway_members": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "gateway_slot": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "lock_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pending_cmd_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pending_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pending_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "poll_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "push_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "queue_depth_after": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "registered_children": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "remaining_pending_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "run_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ack_latency_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "duration_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "ts_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "wait_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "outcome": {
+      "enum": [
+        "cancelled",
+        "error",
+        "ok",
+        "stopped"
+      ]
+    },
+    "source": {
+      "enum": [
+        "cache",
+        "socket"
+      ]
+    },
+    "operation": {
+      "enum": [
+        "call",
+        "control",
+        "request"
+      ]
+    },
+    "socket_present": {
+      "type": "boolean"
+    },
+    "worker_alive": {
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "cmd_request"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "cmd_id",
+          "dp_count"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "cmd_complete"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "cmd_id",
+          "duration_ms",
+          "outcome"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "command_lock_wait",
+              "command_lock_acquired",
+              "command_lock_released"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "cmd_id",
+          "lock_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "gateway_lock_wait",
+              "gateway_lock_acquired",
+              "gateway_lock_released",
+              "lock_cancelled"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "lock_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "command_lock_acquired",
+              "gateway_lock_acquired"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "wait_ms"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "debounce_start",
+              "debounce_done"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "cmd_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "debounce_done"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "duration_ms"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "retry"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "attempt"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "pending_snapshot",
+              "mark_sent",
+              "stale_mark_sent_ignored",
+              "pending_expire",
+              "ack_timeout",
+              "push_ack"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "cmd_id",
+          "pending_generation"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "push_ack"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "ack_latency_ms",
+          "remaining_pending_count"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "broker_enqueue",
+              "broker_execute_start",
+              "broker_execute_done",
+              "broker_cancelled",
+              "tuya_send_start",
+              "tuya_send_result"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "call_id",
+          "operation",
+          "gateway_slot"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "broker_enqueue"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "broker_queue_depth",
+          "broker_pending_futures"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "broker_execute_start"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "wait_ms"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "broker_execute_done",
+              "tuya_send_result"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "duration_ms",
+          "outcome"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "broker_drain_start",
+              "broker_drain_done"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot",
+          "batch_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "broker_drain_done"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "calls_executed",
+          "duration_ms",
+          "queue_depth_after"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "poll_due",
+              "poll_start",
+              "poll_done",
+              "poll_error"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot",
+          "child_slot",
+          "poll_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "poll_done",
+              "poll_error"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "duration_ms"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "push_rx",
+              "push_dispatch"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot",
+          "child_slot",
+          "push_id",
+          "source"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "child_register",
+              "child_unregister"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot",
+          "child_slot"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "gateway_start",
+              "gateway_stop",
+              "disconnect",
+              "reconnect",
+              "worker_failure"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "health"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gateway_slot",
+          "broker_queue_depth",
+          "broker_pending_futures",
+          "registered_children",
+          "gateway_members",
+          "socket_present",
+          "worker_alive"
+        ]
+      }
+    }
+  ]
+}

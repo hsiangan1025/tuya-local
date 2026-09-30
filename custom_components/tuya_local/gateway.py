@@ -123,6 +123,7 @@ class GatewayRegistry:
                             api, lambda data: gateway.deliver(cid, data)
                         )
                     gateway.members[callback] = cid
+                    gateway.broker.trace_gateway_members = len(gateway.members)
                     return gateway, gateway.apis[cid]
             except BaseException:
                 if not gateway.members:
@@ -137,6 +138,7 @@ class GatewayRegistry:
                 return
             async with gateway.lock:
                 cid = gateway.members.pop(callback)
+                gateway.broker.trace_gateway_members = len(gateway.members)
                 if cid not in gateway.members.values():
                     api = gateway.apis.pop(cid)
                     gateway.broker.unregister_child(api)
