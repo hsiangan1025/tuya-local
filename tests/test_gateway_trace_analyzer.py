@@ -1,10 +1,12 @@
 """Synthetic complete/broken canary captures, without HA or real identifiers."""
 
 import json
+import sys
+from io import StringIO
 
 import pytest
 
-from tools.analyze_gateway_trace import analyze, parse
+from tools.analyze_gateway_trace import analyze, main, parse
 
 
 def valid_events():
@@ -268,3 +270,105 @@ def test_process_local_ids_are_scoped_by_run():
     result = analyze(first + second)
     assert result["status"] == "PASS"
     assert result["commands"]["logical_commands"] == 2
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("\x1b[36m", "\x1b[0m"),
+        ("\x1b[1;36m", "\x1b[0m\x1b[K\r\n"),
+        ("\x9b36m", "\x9b0m"),
+        ("\x1b]0;PRIVATE_SENTINEL\x07\x1b[36m", "\x1b[0m"),
+        ("\x1b]0;PRIVATE_SENTINEL\x1b\\", "\x1b[0m"),
+        ("\x9d0;PRIVATE_SENTINEL\x9c", "\x9b0m"),
+    ],
+)
+def test_terminal_coloring_preserves_records_and_analysis(prefix, suffix):
+    plain = lines(valid_events())
+    colored = [prefix + line + suffix for line in plain]
+    assert parse(colored) == parse(plain)
+    assert analyze(colored) == analyze(plain)
+    assert "PRIVATE_SENTINEL" not in json.dumps(analyze(colored))
+
+
+def test_color_changes_inside_ha_prefix_and_before_marker():
+    plain = lines(valid_events())
+    colored = [
+        "\x1b[36m"
+        + line.replace(" DEBUG ", " \x1b[1mDEBUG\x1b[22m ").replace(
+            " GBTRACE ", " \x1b[0mGBTRACE \x1b[36m"
+        )
+        + "\x1b[0m\n"
+        for line in plain
+    ]
+    assert parse(colored) == parse(plain)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "GBTRACE {broken}",
+        'GBTRACE {"v":1,"event":"gateway_start","run_id":1,"seq":1}',
+        'GBTRACE {"v":1,"event":"gateway_start","run_id":1,"seq":true,"ts_ms":0}',
+        'GBTRACE {"v":1,"event":"gateway_start","run_id":1,"seq":1,"ts_ms":NaN}',
+        'GBTRACE {"v":2,"event":"gateway_start","run_id":1,"seq":1,"ts_ms":0}',
+        'GBTRACE {"v":1,"event":"PRIVATE_SENTINEL","run_id":1,"seq":1,"ts_ms":0}',
+        lines(valid_events())[0].replace("GBTRACE", "NOTGBTRACE"),
+        lines(valid_events())[0] + " PRIVATE_SENTINEL",
+        lines(valid_events())[0] + "\x1b[",
+        lines(valid_events())[0] + "\x1b]PRIVATE_SENTINEL",
+    ],
+)
+def test_colored_malformed_input_stays_ignored(line):
+    colored = "\x1b[36m" + line + "\x1b[0m"
+    assert parse([line]) == []
+    assert parse([colored]) == []
+    result = analyze([colored])
+    assert result["warnings"] == ["no_valid_trace_events"]
+    assert "PRIVATE_SENTINEL" not in json.dumps(result)
+
+
+def test_osc_contents_cannot_inject_trace_events():
+    hidden = "\x1b]0;" + lines(valid_events())[0] + "\x07"
+    assert parse([hidden]) == []
+    visible = lines(valid_events())[1]
+    assert parse([hidden + visible]) == parse([visible])
+
+
+@pytest.mark.parametrize("stdin", [False, True])
+def test_cli_reads_colored_ha_logs_without_echo(stdin, tmp_path, monkeypatch, capsys):
+    plain = lines(valid_events())
+    text = "\n".join("\x1b[36m" + line + "\x1b[0m" for line in plain)
+    text += "\n\x1b[31mPRIVATE_SENTINEL_NOT_A_TRACE\x1b[0m\n"
+    if stdin:
+        argument = "-"
+        monkeypatch.setattr(sys, "stdin", StringIO(text))
+    else:
+        path = tmp_path / "ha.log"
+        path.write_text(text)
+        argument = str(path)
+    monkeypatch.setattr(sys, "argv", ["analyze_gateway_trace.py", argument])
+    assert main() == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out) == analyze(plain)
+    assert "PRIVATE_SENTINEL" not in output.out
+    assert output.err == ""
+
+
+@pytest.mark.parametrize(
+    ("last_event", "failure"),
+    [
+        ("gateway_lock_wait", "lock_leak_or_unfinished_wait"),
+        ("gateway_lock_acquired", "lock_leak_or_unfinished_wait"),
+        ("broker_enqueue", "unfinished_broker_call"),
+        ("broker_execute_start", "unfinished_broker_call"),
+        ("poll_start", "unfinished_or_malformed_poll"),
+        ("broker_drain_start", "unfinished_or_malformed_drain_batch"),
+    ],
+)
+def test_strict_analysis_retains_tail_open_lifecycle_failures(last_event, failure):
+    events = valid_events()
+    boundary = next(i for i, e in enumerate(events) if e["event"] == last_event)
+    result = analyze(lines(events[: boundary + 1]))
+    assert result["status"] == "FAIL"
+    assert failure in result["failures"]

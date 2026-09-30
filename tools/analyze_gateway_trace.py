@@ -15,6 +15,14 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+# Remove complete terminal CSI/OSC sequences, including ha core logs' SGR
+# colors. OSC contents are discarded as a unit, never treated as log records.
+# Do not consume line boundaries or incomplete escapes to salvage malformed
+# input. JSON parsing and the schema/field privacy checks below stay unchanged.
+ANSI = re.compile(
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"
+    r"|(?:\x1b\]|\x9d)[^\x07\x1b\x9c\r\n]*(?:\x07|\x1b\\|\x9c)"
+)
 PATTERN = re.compile(r"(?:^|\s)GBTRACE (\{[^\n]*\})\s*$")
 EVENTS = set(
     "gateway_start gateway_stop child_register child_unregister cmd_request "
@@ -53,7 +61,7 @@ def parse(lines):
     records = []
     seen = set()
     for line in lines:
-        match = PATTERN.search(line)
+        match = PATTERN.search(ANSI.sub("", line))
         if not match:
             continue
         try:

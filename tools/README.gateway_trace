@@ -43,6 +43,9 @@ Usage (standard library only; keep the JSON schema beside the analyzer):
 
 Output is deterministic JSON. Exit codes are PASS=0, WARN=1, FAIL=2. Only
 GBTRACE JSON is parsed; malformed/foreign lines and fields are not echoed.
+Ordinary ha core logs output may be supplied directly: complete ANSI CSI colors
+and OSC terminal sequences are removed before matching. Incomplete escapes are
+not repaired, and the same JSON/schema validation still applies.
 Latency distributions are milliseconds with linearly interpolated percentiles.
 Polling's short window is one second, separately per process and gateway.
 Commands.acknowledged counts commands whose observed remaining count reached
@@ -56,6 +59,20 @@ nondecreasing backlog in the last three health observations. Missing ACK alone,
 ACK timeout, error completion or cancellation are WARN, never proof of failure.
 Live gateways need not stop before a capture ends; started commands, calls,
 lock acquisitions, polls and drain batches must finish for a clean result.
+Analysis remains strict; there is no live-capture exemption or age threshold.
+An incomplete chain at EOF means the capture cannot establish completion, not
+that a runtime leak has been proved. For a lifecycle PASS, select a capture
+window containing complete lifecycles through a quiescent boundary. This does
+not require stopping the gateway. If no such boundary exists, retain the FAIL
+and inspect each open chain's first/last seq, timestamps and age at capture end.
+Do not discard old unresolved operations just because newer work is active.
+Blocking TinyTuya operations have no trace-enforced deadline, so recency alone
+cannot safely distinguish a slow operation from a leak. A final enqueue can be
+unobserved work at EOF while concurrent polls have already waited a long time.
+Final queue/pending fields are the last eligible observations, not an EOF census:
+final_queue_depth uses health/drain-done, final_pending_futures uses health.
+Inspect later enqueues too. A worker-side execute-done does not itself prove that
+HA has processed the result callback and removed that future from _pending.
 
 Limits: capture from before the relevant lifecycles through their completion.
 Truncation, runtime logging changes or dropped log records can resemble missing
