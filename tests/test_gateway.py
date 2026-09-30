@@ -57,6 +57,7 @@ class FakeAPI:
         self.children = {}
         self.received_wrong_cid_queue = []
         self.socket = None
+        self.retry = True
         self.version = parent.version if parent else version
         self.disabledetect = True
         self.calls = []
@@ -74,6 +75,10 @@ class FakeAPI:
 
     def set_socketRetryLimit(self, count):
         self.record("retry_limit", count)
+
+    def set_retry(self, retry):
+        self.record("receive_retry", retry)
+        self.retry = retry
 
     def set_socketPersistent(self, value):
         self.record("persistent", value)

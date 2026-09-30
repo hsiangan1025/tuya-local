@@ -1,0 +1,143 @@
+Gateway selector receive: TinyTuya 1.20.0 causal reproduction and minimal fix
+
+Scope
+
+Only GatewayBroker's selector-driven parent.receive() temporarily disables
+parent.retry. A finally block restores the exact previous value before dispatch,
+disconnect handling, another queued operation, heartbeat, or worker cleanup.
+Standalone devices, child status/control retry policy, socket timeout,
+socketRetryLimit, socketRetryDelay, heartbeat/select intervals, poll cadence,
+locks and broker reconnect/backoff logic are unchanged.
+
+This is a targeted empty-frame retry fix, not a nonblocking receive API or a
+general upper bound on gateway latency. No live deployment is part of this work.
+
+Dependency control flow (installed TinyTuya 1.20.0)
+
+core/XenonDevice.py:
+  receive() delegates directly to self._send_receive(None).
+  _send_receive() sets max_recv_retries to 0 if retry is false, otherwise to
+  socketRetryLimit. It starts recv_retries at 0 and calls _receive().
+  An empty TuyaMessage is an acknowledged frame: partial_success becomes true,
+  payload becomes None, and the empty-payload branch increments recv_retries.
+  With retry=True and socketRetryLimit=1, 1 is not greater than 1, so the loop
+  calls _receive() a second time. If that raises socket.timeout, the receive-only
+  path returns None without closing a persistent socket.
+  With retry=False, max_recv_retries=0; the first increment makes 1 > 0, ending
+  the loop. _process_message() returns None for the empty frame. No second
+  _receive() is attempted.
+
+core/Device.py:
+  heartbeat(nowait=True) uses _send_receive(..., getresponse=False). It sends the
+  heartbeat but leaves its reply for the selector receive path.
+
+Single-owner reasoning
+
+The owner thread drains broker calls, checks the connection, sends a due
+heartbeat, drains cached pushes, and selects/receives. Calls submitted while
+heartbeat/receive is running remain queued until the next drain. There is no
+await, new lock, worker wakeup, or callback invocation inside the temporary
+retry=False region. All supported status, control, updatedps and configure
+operations execute on that same worker after restoration. No global retry
+setting is changed. External code directly using parent transport would violate
+the existing ownership contract and is not made safe by this change.
+
+An asyncio caller cancellation does not interrupt the Python I/O thread.
+Shutdown joins the owner before disposing of it; cancellation of the stop waiter
+does not cancel that join. If a first-frame read is blocked, restoration happens
+when the read exits, not at the instant shutdown is requested. A finally block
+also restores the value if a BaseException unwinds the receive call.
+
+Deterministic tests, with no device network
+
+tests/test_gateway_receive.py uses the installed Device/XenonDevice methods.
+The direct reproduction substitutes only _receive() results: an empty
+TuyaMessage followed by socket.timeout. A spy proves receive() invokes the real
+_send_receive(None), with two reads for retry=True and one for retry=False;
+both return None. A version guard requires this reviewed TinyTuya 1.20.0.
+
+The broker reproduction goes further: the real heartbeat, receive,
+_send_receive, _receive, _recv_all, decryptor and frame decoder run against a
+scripted byte socket. Sending the heartbeat makes a complete empty reply
+readable and enqueues a call. An empty socket models a five-second timeout by
+advancing a private clock, never sleeping or using a virtual asyncio loop.
+The baseline comparison leaves retry enabled by making the candidate's setter
+a no-op; it does not reimplement TinyTuya's control flow. The candidate uses
+the real setter and the same broker and input bytes.
+
+  baseline: 2 _receive calls, 2 socket reads, queued work after 5010 modeled ms
+  candidate: 1 _receive call, 1 socket read, queued work after 10 modeled ms
+
+The remaining 10 ms is TinyTuya's existing heartbeat sendWait, included in both
+cases. These deterministic times demonstrate control flow, not a hardware SLA.
+The test also checks that heartbeat/connect/disconnect behavior and all listed
+transport timing settings are unchanged for the complete empty-ACK case.
+
+Further tests exercise a real worker thread with queued real child status,
+control, updatedps and GatewayConnection.configure operations. None executes
+during receive; all observe the original retry setting. Child status still
+reads past an empty ACK to obtain its response. Coalesced ACK/data frames for
+protocols 3.3, 3.4 and 3.5 leave the data for a later selector iteration, with
+queued work serviced in between. Tests cover restoration after data, None,
+exception, BaseException cancellation, stop and cancelled stop waiters.
+
+Malformed and truncated frames: explicit limits and changed behavior
+
+  Complete frame in several available TCP chunks:
+    TinyTuya's first _receive/_recv_all still assembles and decodes it under
+    either retry setting. TCP reads and protocol frames are not interchangeable.
+
+  Truncated header/body with no remaining bytes:
+    The FIRST _receive can still block until the existing socket timeout.
+    TinyTuya returns None, preserves the persistent socket, and does not retain
+    _recv_all's partial bytes across calls. This pre-existing loss of partial
+    framing state is not repaired by retry suppression. A selector only proves
+    some bytes are readable, not that an entire frame is available.
+
+  DecodeError (e.g. oversized header or failed 3.5 GCM authentication):
+    retry=True can read a subsequent valid frame on the same socket. retry=False
+    exhausts the read-retry budget immediately, returns ERR_PAYLOAD (904), and
+    TinyTuya force-closes the socket if there was no valid frame. Tests explicitly
+    compare both behaviors and verify the corrupt frame is never dispatched as
+    valid data. This changes recovery timing and can discard a following good
+    frame on that connection. The broker then uses its existing reconnect path,
+    after retry has been restored. Reconnect code/settings are unchanged; it
+    would be incorrect to claim identical reconnect frequency on corrupt input.
+
+  Complete decrypted payload that is invalid JSON:
+    TinyTuya returns ERR_JSON (900) under both settings, with one _receive call;
+    it does not force-close this persistent socket merely for invalid JSON.
+
+Other blocking paths remain: prefix resynchronization inside a first frame,
+TinyTuya's separate socket-error reconnect/send retries, and synchronous child
+requests. parent.retry only controls the additional receive/DecodeError budget;
+it does not disable every retry mechanism in TinyTuya.
+
+Monitor comparison
+
+TinyTuya 1.20.0 core/Monitor.py intentionally uses its own framing path.
+_handle_readable() makes one sock.recv(4096), appends to state.recv_buffer, and
+calls _process_buffer(). Incomplete prefixes, headers and bodies remain buffered
+until another readable event. Complete empty payloads are discarded without
+waiting for a following frame. Tests run those real Monitor methods on an empty
+ACK and a fragmented data frame without constructing its sockets/reactor.
+
+Monitor keeps sockets blocking for compatibility with TinyTuya's send path; it
+avoids the particular read-until-complete loop by buffering across select events.
+It also forces socketRetryLimit=0 during reactor ownership and has a separate
+reconnect workflow. Those broader lifecycle/send changes are not copied here.
+
+Recommendation
+
+Use the local retry suppression as a narrowly scoped candidate for review and a
+future authorized canary. It removes the reproduced second-frame wait while
+preserving ownership and ordinary command retry behavior. Accepting it includes
+the documented earlier close/reconnect on DecodeError; strict equivalence for
+malformed-frame recovery is not claimed.
+
+No evidence here requires a large new parser to fix the complete empty-ACK
+stall. A buffered receive helper WOULD be needed to guarantee prompt service
+under fragmented/truncated input or retain partial frames across timeouts. That
+is a separate design problem requiring coordination with synchronous child
+requests, encryption/session state, CID caches, and socket replacement. A helper
+that merely calls _receive() once would still block on incomplete first frames.

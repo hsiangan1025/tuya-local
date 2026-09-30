@@ -249,7 +249,17 @@ class GatewayBroker:
 
                 try:
                     with trace.worker_phase(self, "receive") as observation:
-                        data = self._parent.receive()
+                        # TinyTuya retries an empty heartbeat ACK by reading a
+                        # second frame, blocking this sole I/O owner until the
+                        # socket timeout. Let select handle the next frame.
+                        # Only this worker uses the parent; restore before
+                        # queued calls, broker reconnects, heartbeats or cleanup.
+                        old_retry = self._parent.retry
+                        try:
+                            self._parent.set_retry(False)
+                            data = self._parent.receive()
+                        finally:
+                            self._parent.set_retry(old_retry)
                         if observation is not None:
                             observation["outcome"] = trace.io_outcome(data)
                 except Exception as exc:

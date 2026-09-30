@@ -27,6 +27,7 @@ def owner(mocker, caplog):
         connection_timeout=5,
         socketRetryLimit=5,
         socketRetryDelay=5,
+        retry=True,
         received_wrong_cid_queue=[],
     )
     calls = []
@@ -42,6 +43,9 @@ def owner(mocker, caplog):
 
     parent.set_socketPersistent = mocker.Mock(side_effect=persistent)
     parent.set_socketRetryLimit = mocker.Mock(side_effect=retry_limit)
+    parent.set_retry = mocker.Mock(
+        side_effect=lambda value: setattr(parent, "retry", value)
+    )
     parent._get_socket = mocker.Mock()
     parent.heartbeat = mocker.Mock()
     parent.receive = mocker.Mock()
@@ -223,6 +227,11 @@ def test_instrumentation_preserves_worker_io_and_settings(
     owner.parent._get_socket.assert_not_called()
     owner.parent.heartbeat.assert_called_once_with(nowait=True)
     owner.parent.receive.assert_called_once_with()
+    assert owner.parent.retry is True
+    assert owner.parent.set_retry.call_args_list == [
+        mocker.call(False),
+        mocker.call(True),
+    ]
     assert owner.parent.connection_timeout == 5
     assert owner.parent.socketRetryLimit == 1  # The pre-existing worker setting.
     assert owner.parent.socketRetryDelay == 5
