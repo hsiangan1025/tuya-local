@@ -20,11 +20,14 @@ async def initialized_children(gateway_env):
 
 
 @pytest.mark.parametrize("poll_delay", [0, 0.05, 0.25])
-async def test_aligned_safety_polls_and_outbound_commands(gateway_env, poll_delay):
+@pytest.mark.parametrize("handoff", ["worker_first", "loop_first"])
+async def test_aligned_safety_polls_and_outbound_commands(
+    gateway_env, poll_delay, handoff
+):
     """20 repeated worst-case bursts, with controls before/during/after each."""
     children = await initialized_children(gateway_env)
     bound = 13 * (0.2 + poll_delay) + 0.4
-    async with GatewayClock(children, poll_delay) as clock:
+    async with GatewayClock(children, poll_delay, handoff=handoff) as clock:
         for child in children:
             child.actually_start()
         for round_number in range(1, 21):
@@ -53,7 +56,7 @@ async def test_aligned_safety_polls_and_outbound_commands(gateway_env, poll_dela
         assert clock.queue.maximum_pending <= 1
         assert not any(clock.pending_samples)
         assert len(clock.push_latencies) == 13 * 20
-        assert max(clock.push_latencies) <= poll_delay + 0.101
+        clock.assert_pushes_once()
         print("ALIGNED_POLL_METRICS=" + json.dumps(clock.summary(), sort_keys=True))
 
 
@@ -91,7 +94,7 @@ async def test_virtual_gateway_soak(gateway_env):
         assert len({c[2] for ch in children for c in ch._api.calls}) == 1
         assert all(ch._api.version == 3.3 for ch in children)
         assert len(clock.push_latencies) == 899
-        assert max(clock.push_latencies) <= 0.101
+        clock.assert_pushes_once()
         print("SOAK_METRICS=" + json.dumps(clock.summary(), sort_keys=True))
 
 

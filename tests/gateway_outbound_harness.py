@@ -7,6 +7,7 @@ share the virtual clock; no production timer or scheduling code is replaced.
 """
 
 import asyncio
+import math
 import queue
 import threading
 from collections import Counter
@@ -96,11 +97,28 @@ class MeasuredQueue(queue.Queue):
         )
         return super().put(call, *args, **kwargs)
 
+    def get_nowait(self):
+        if self.clock.handoff == "loop_first" and not self.clock.closing:
+            # Let result callbacks release the gateway lock and enqueue the
+            # next child before the worker checks the queue. No virtual time
+            # elapses here: this is one legal OS scheduling order.
+            gate = threading.Event()
+
+            def ready():
+                if self.clock.loop._ready or self.clock.due_timers():
+                    self.clock.loop.call_soon(ready)
+                else:
+                    gate.set()
+
+            self.clock.loop.call_soon_threadsafe(ready)
+            assert gate.wait(10), "event-loop handoff did not settle"
+        return super().get_nowait()
+
 
 class GatewayClock:
     """Advance many gateway minutes deterministically, including 100 ms select."""
 
-    def __init__(self, children, poll_delay=0):
+    def __init__(self, children, poll_delay=0, *, handoff=None):
         self.children = children
         self.loop = asyncio.get_running_loop()
         self.broker = children[0]._broker
@@ -123,17 +141,28 @@ class GatewayClock:
         self.push_latencies = []
         self.push_times = {}
         self.poll_delay = poll_delay
+        self.handoff = handoff
+        self.deliveries = []
+        self.polls = []
 
     @property
     def elapsed(self):
         return self.now - self.origin
 
     def wall_time(self):
-        return 1000000 + self.elapsed
+        # Use one floating-point domain. Translating to a different-magnitude
+        # wall clock can leave a positive residual deadline smaller than one
+        # monotonic ULP, repeatedly scheduling an immediate asyncio timeout.
+        return self.now
 
     async def __aenter__(self):
         self.loop.set_debug(False)
         self.patches.enter_context(patch.object(self.loop, "time", lambda: self.now))
+        # asyncio may otherwise promote a timer slightly before its deadline.
+        # With a frozen clock that can endlessly reschedule a not-yet-due poll.
+        self.patches.enter_context(
+            patch.object(self.loop, "_clock_resolution", math.ulp(self.now))
+        )
         self.patches.enter_context(patch.object(device_module, "time", self.wall_time))
         self.patches.enter_context(
             patch.object(
@@ -145,6 +174,20 @@ class GatewayClock:
         )
         self.broker._calls = self.queue
         self.broker._last_heartbeat = self.now
+        if self.handoff == "worker_first":
+            complete = self.broker._set_future_result
+
+            def after_worker_parks(future, result):
+                # Exercise the other legal order: the worker checks its empty
+                # queue and enters select before HA handles the result.
+                if self.parked is None and not self.closing:
+                    self.next_park.add_done_callback(lambda _: complete(future, result))
+                else:
+                    complete(future, result)
+
+            self.patches.enter_context(
+                patch.object(self.broker, "_set_future_result", after_worker_parks)
+            )
         self.children[0]._gateway.lock = self.lock
         for child in self.children:
             child._api_lock = self.lock
@@ -168,6 +211,7 @@ class GatewayClock:
                 sent = self.push_times.get((child.dev_cid, data.get("2")))
                 if sent is not None:
                     self.push_latencies.append(self.elapsed - sent)
+                    self.deliveries.append((child.dev_cid, data["2"]))
                 return original(data)
 
             self.patches.enter_context(
@@ -176,9 +220,14 @@ class GatewayClock:
             status = child._api.status
 
             def delayed_status(*, original=status):
+                poll = {"start": self.elapsed}
+                self.polls.append(poll)
                 if self.poll_delay:
                     self.park(self.poll_delay, "status")
-                return original()
+                try:
+                    return original()
+                finally:
+                    poll["end"] = self.elapsed
 
             self.patches.enter_context(
                 patch.object(child._api, "status", delayed_status)
@@ -229,6 +278,10 @@ class GatewayClock:
         self.parked = (gate, kind, timer)
         if not self.next_park.done():
             self.next_park.set_result(None)
+        # Readiness is level-triggered. The producer may have run after the
+        # worker's first check but before this registration reached the loop.
+        if kind == "select" and self.parent.pushes:
+            self.wake()
 
     def wake(self):
         if self.parked is None:
@@ -245,32 +298,61 @@ class GatewayClock:
         return ([read[0]] if read[0].pushes else [], [], [])
 
     async def settle(self):
-        # Let timers, future callbacks, lock handoffs and debounce tasks settle
-        # before advancing. The worker signals when it has reached its next wait.
-        for _ in range(4):
+        # All worker wakeups and timer registrations belong to this loop. Once
+        # parked AND the ready queue/due timers are empty, neither side can
+        # progress until the driver advances time. A fixed number of loop turns
+        # is insufficient for arbitrary callback chains and lock handoffs.
+        while True:
             await asyncio.sleep(0)
-        if self.parked is None:
-            await asyncio.shield(self.next_park)
-        for _ in range(4):
-            await asyncio.sleep(0)
+            if self.parked is None:
+                await asyncio.shield(self.next_park)
+                continue
+            if not self.loop._ready and not self.due_timers():
+                return
+
+    def due_timers(self):
+        """The same due-time boundary used by asyncio's timer promotion."""
+        return any(
+            not handle.cancelled()
+            and handle.when() < self.now + self.loop._clock_resolution
+            for handle in self.loop._scheduled
+        )
 
     async def advance_to(self, elapsed):
         target = self.origin + elapsed
         assert target >= self.now
         while self.now < target:
             await self.settle()
+            assert self.parked is not None and not self.due_timers()
             deadlines = [
                 handle.when()
                 for handle in self.loop._scheduled
                 if not handle.cancelled() and handle.when() > self.now
             ]
             self.now = min(target, min(deadlines, default=target))
+            self.loop._clock_resolution = math.ulp(self.now)
             await self.settle()
+
+    def push_latency_bound(self):
+        """Finite burst: one select wait plus every blocking status ahead.
+
+        There is one successful status per child and no retries in this model.
+        Configure, control and heartbeat have zero modeled duration. A readable
+        socket cannot incur further select waits. This is not a hardware SLA.
+        """
+        return self.broker._select_timeout + len(self.children) * self.poll_delay
+
+    def assert_pushes_once(self):
+        assert Counter(self.deliveries) == Counter(
+            (cid, value) for cid, value, _ in self.pushes
+        )
+        # Tolerance is solely for floating-point virtual timestamp arithmetic.
+        assert max(self.push_latencies, default=0) <= self.push_latency_bound() + 1e-6
 
     def align_polls(self, deadline):
         """Force a repeated worst-case burst; the separate soak never realigns."""
         for child in self.children:
-            child._last_full_poll = 1000000 + deadline - 30
+            child._last_full_poll = self.origin + deadline - 30
             child._gateway_poll_event.set()
 
     def command_at(self, at, child, value, label):
@@ -323,10 +405,15 @@ class GatewayClock:
         return {
             "virtual_seconds": round(self.elapsed, 3),
             "status_response_delay": self.poll_delay,
+            "handoff": self.handoff,
+            "push_latency_bound": self.push_latency_bound(),
+            "poll_timing": self.polls,
             "commands": len(self.commands),
             "control_calls": len(self.controls),
             "max_command_latency": maximum(
-                c["completed"] - c["submitted"] for c in self.commands
+                c["completed"] - c["submitted"]
+                for c in self.commands
+                if "completed" in c
             ),
             "max_lock_wait": maximum(
                 w.acquired - w.requested
@@ -343,7 +430,7 @@ class GatewayClock:
             "max_execution_duration": maximum(
                 c["ended"] - c["started"]
                 for c in self.queue.calls
-                if c["started"] is not None
+                if c["ended"] is not None
             ),
             "settled_pending": self.pending_samples,
             "pushes_delivered": len(self.push_latencies),
