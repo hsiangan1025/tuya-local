@@ -4,7 +4,8 @@ on: [push, pull_request]
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, asus-vivobook-s, asus-vivobook-s-vm]
     permissions:
       checks: write
       contents: read
@@ -20,6 +21,16 @@ jobs:
         with:
           python-version: '3.14'
 
+      - name: Prepare isolated ASUS CI Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          ci_venv="$RUNNER_TEMP/asus-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          python -m venv "$ci_venv"
+          echo "$ci_venv/bin" >> "$GITHUB_PATH"
+          echo "ASUS_CI_VENV=$ci_venv" >> "$GITHUB_ENV"
+          echo "UV_PROJECT_ENVIRONMENT=$ci_venv" >> "$GITHUB_ENV"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - name: Python lint
@@ -30,3 +41,14 @@ jobs:
         run: uv run ruff format --check --diff .
       - name: YAML lint
         run: uv run yamllint --format github custom_components/tuya_local/devices
+
+      - name: Remove isolated ASUS CI Python
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${ASUS_CI_VENV:-}" ]]; then
+            case "$ASUS_CI_VENV" in
+              "$RUNNER_TEMP"/asus-ci-*) rm -rf -- "$ASUS_CI_VENV" ;;
+              *) echo 'Unexpected CI environment path'; exit 1 ;;
+            esac
+          fi

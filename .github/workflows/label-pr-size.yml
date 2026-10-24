@@ -4,7 +4,8 @@ on: [pull_request_target]
 
 jobs:
   add_pr_size_label:
-    runs-on: ubuntu-latest
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, asus-vivobook-s, asus-vivobook-s-vm]
     name: Check PR size
     permissions:
       contents: write

@@ -1,0 +1,41 @@
+name: ASUS VM CI readiness
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/asus-vm-readiness.yml'
+permissions:
+  contents: read
+concurrency:
+  group: asus-vm-readiness-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  vm-readiness:
+    runs-on: [self-hosted, linux, x64, asus-vivobook-s, asus-vivobook-s-vm]
+    timeout-minutes: 5
+    steps:
+      - name: Verify ASUS VM and shared execution limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(getconf _NPROCESSORS_ONLN)" = 10
+          test -r /proc/self/io
+          python3 - <<'PY'
+          import json, os, platform
+          from pathlib import Path
+          assert 'microsoft' not in platform.release().lower(), 'WSL is not the VM target'
+          config=json.loads(Path('/home/ci-smoke/ci-tools/resources.json').read_text())
+          assert config == {'logical_processors':10,'memory_gb':8,'max_concurrent_jobs':2}
+          memory=int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:')))
+          assert 7*1024*1024 <= memory <= 8*1024*1024
+          assert os.getuid()!=0
+          assert os.environ.get('ACTIONS_RUNNER_HOOK_JOB_STARTED') == '/home/ci-smoke/ci-tools/ci-job-start.sh'
+          print(json.dumps({'runner':os.environ['RUNNER_NAME'],'kernel':platform.release(),'cpus':os.cpu_count(),'memory_kb':memory,'max_jobs':config['max_concurrent_jobs']}))
+          PY
+          echo "SLOT_START $(date -Iseconds) $RUNNER_NAME"
+          sleep 12
+          echo "SLOT_END $(date -Iseconds) $RUNNER_NAME"
+      - name: Record runner readiness
+        run: echo "ASUS VM ready on $RUNNER_NAME; global limit 2 jobs" >> "$GITHUB_STEP_SUMMARY"
